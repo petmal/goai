@@ -59,7 +59,7 @@ func Embed(ctx context.Context, model provider.EmbeddingModel, value string, opt
 		ProviderOptions: o.EmbeddingProviderOptions,
 	}
 
-	result, err := withRetry(ctx, o.MaxRetries, func() (*provider.EmbedResult, error) {
+	result, err := withRetry(ctx, o.MaxRetries, o.RetryObserver, func() (*provider.EmbedResult, error) {
 		return model.DoEmbed(ctx, []string{value}, embedParams)
 	})
 	if err != nil {
@@ -110,7 +110,7 @@ func EmbedMany(ctx context.Context, model provider.EmbeddingModel, values []stri
 
 	// Single call when no chunking needed.
 	if maxPerCall <= 0 || len(values) <= maxPerCall {
-		result, err := withRetry(ctx, o.MaxRetries, func() (*provider.EmbedResult, error) {
+		result, err := withRetry(ctx, o.MaxRetries, o.RetryObserver, func() (*provider.EmbedResult, error) {
 			return model.DoEmbed(ctx, values, embedParams)
 		})
 		if err != nil {
@@ -151,7 +151,7 @@ func EmbedMany(ctx context.Context, model provider.EmbeddingModel, values []stri
 				results[i] = embedChunkResult{err: err}
 				continue
 			}
-			r, err := withRetry(ctx, o.MaxRetries, func() (*provider.EmbedResult, error) {
+			r, err := withRetry(ctx, o.MaxRetries, o.RetryObserver, func() (*provider.EmbedResult, error) {
 				return model.DoEmbed(ctx, chunk, embedParams)
 			})
 			results[i] = embedChunkResult{result: r, err: err}
@@ -173,7 +173,7 @@ func EmbedMany(ctx context.Context, model provider.EmbeddingModel, values []stri
 					return
 				}
 
-				r, err := withRetry(ctx, o.MaxRetries, func() (*provider.EmbedResult, error) {
+				r, err := withRetry(ctx, o.MaxRetries, o.RetryObserver, func() (*provider.EmbedResult, error) {
 					return model.DoEmbed(ctx, chunk, embedParams)
 				})
 				results[i] = embedChunkResult{result: r, err: err}

@@ -40,7 +40,7 @@ func GenerateImage(ctx context.Context, model provider.ImageModel, opts ...Image
 		ProviderOptions: o.providerOptions,
 	}
 
-	result, err := withRetry(ctx, o.maxRetries, func() (*provider.ImageResult, error) {
+	result, err := withRetry(ctx, o.maxRetries, nil, func() (*provider.ImageResult, error) {
 		return model.DoGenerate(ctx, params)
 	})
 	if err != nil {

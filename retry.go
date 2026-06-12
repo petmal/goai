@@ -145,14 +145,21 @@ func parseRetryFromBody(msg string) time.Duration {
 	return time.Duration(v) * time.Second
 }
 
+// RetryObserver is called before each retry attempt, giving the caller a chance
+// to log or observe the retry step.
+type RetryObserver func(attempt int, err error, delay time.Duration)
+
 // withRetry executes fn up to maxRetries+1 times, retrying on retryable errors.
 // Respects Retry-After/Retry-After-ms headers when present; falls back to
 // exponential backoff otherwise.
-func withRetry[T any](ctx context.Context, maxRetries int, fn func() (T, error)) (T, error) {
+func withRetry[T any](ctx context.Context, maxRetries int, observer RetryObserver, fn func() (T, error)) (T, error) {
 	result, err := fn()
 	attempt := 0
 	for ; err != nil && retryable(err) && attempt < maxRetries; attempt++ {
 		delay := retryDelay(err, attempt)
+		if observer != nil {
+			observer(attempt, err, delay)
+		}
 		if sleepErr := sleep(ctx, delay); sleepErr != nil {
 			var zero T
 			return zero, sleepErr

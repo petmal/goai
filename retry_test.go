@@ -64,7 +64,7 @@ func TestBackoffDuration(t *testing.T) {
 
 func TestWithRetry_Success(t *testing.T) {
 	calls := 0
-	result, err := withRetry(t.Context(), 2, func() (string, error) {
+	result, err := withRetry(t.Context(), 2, nil, func() (string, error) {
 		calls++
 		return "ok", nil
 	})
@@ -81,7 +81,7 @@ func TestWithRetry_Success(t *testing.T) {
 
 func TestWithRetry_RetryThenSuccess(t *testing.T) {
 	calls := 0
-	result, err := withRetry(t.Context(), 2, func() (string, error) {
+	result, err := withRetry(t.Context(), 2, nil, func() (string, error) {
 		calls++
 		if calls < 3 {
 			return "", &APIError{StatusCode: http.StatusTooManyRequests, IsRetryable: true, Message: "rate limited"}
@@ -101,7 +101,7 @@ func TestWithRetry_RetryThenSuccess(t *testing.T) {
 
 func TestWithRetry_AllFail(t *testing.T) {
 	calls := 0
-	_, err := withRetry(t.Context(), 2, func() (string, error) {
+	_, err := withRetry(t.Context(), 2, nil, func() (string, error) {
 		calls++
 		return "", &APIError{StatusCode: http.StatusServiceUnavailable, IsRetryable: true, Message: "unavailable"}
 	})
@@ -115,7 +115,7 @@ func TestWithRetry_AllFail(t *testing.T) {
 
 func TestWithRetry_NonRetryable(t *testing.T) {
 	calls := 0
-	_, err := withRetry(t.Context(), 2, func() (string, error) {
+	_, err := withRetry(t.Context(), 2, nil, func() (string, error) {
 		calls++
 		return "", &APIError{StatusCode: http.StatusBadRequest, IsRetryable: false, Message: "bad request"}
 	})
@@ -131,7 +131,7 @@ func TestWithRetry_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	calls := 0
 	cancel() // Cancel immediately.
-	_, err := withRetry(ctx, 5, func() (string, error) {
+	_, err := withRetry(ctx, 5, nil, func() (string, error) {
 		calls++
 		return "", &APIError{StatusCode: http.StatusTooManyRequests, IsRetryable: true, Message: "rate limited"}
 	})
@@ -560,7 +560,7 @@ func TestStreamText_WithTimeout(t *testing.T) {
 
 func TestWithRetry_ZeroRetries(t *testing.T) {
 	calls := 0
-	_, err := withRetry(t.Context(), 0, func() (string, error) {
+	_, err := withRetry(t.Context(), 0, nil, func() (string, error) {
 		calls++
 		return "", &APIError{StatusCode: http.StatusTooManyRequests, IsRetryable: true, Message: "rate limited"}
 	})
@@ -577,7 +577,7 @@ func TestWithRetry_ZeroRetries(t *testing.T) {
 // remains unwrappable via errors.As.
 func TestWithRetry_ExhaustionWraps(t *testing.T) {
 	inner := &APIError{StatusCode: http.StatusTooManyRequests, IsRetryable: true, Message: "rate limited"}
-	_, err := withRetry(t.Context(), 2, func() (string, error) {
+	_, err := withRetry(t.Context(), 2, nil, func() (string, error) {
 		return "", inner
 	})
 	if err == nil {
@@ -593,4 +593,97 @@ func TestWithRetry_ExhaustionWraps(t *testing.T) {
 	if apiErr.StatusCode != http.StatusTooManyRequests {
 		t.Errorf("apiErr.StatusCode = %d, want %d", apiErr.StatusCode, http.StatusTooManyRequests)
 	}
+}
+
+func TestWithRetry_ObserverCalled(t *testing.T) {
+	calls := 0
+	var observerCalls []RetryInfo
+	observer := func(attempt int, err error, delay time.Duration) {
+		observerCalls = append(observerCalls, RetryInfo{Attempt: attempt, Err: err, Delay: delay})
+	}
+	result, err := withRetry(t.Context(), 3, observer, func() (string, error) {
+		calls++
+		if calls < 3 {
+			return "", &APIError{StatusCode: http.StatusTooManyRequests, IsRetryable: true, Message: "rate limited"}
+		}
+		return "ok", nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != "ok" {
+		t.Errorf("result = %q", result)
+	}
+	if len(observerCalls) != 2 {
+		t.Fatalf("observerCalls = %d, want 2", len(observerCalls))
+	}
+	if observerCalls[0].Attempt != 0 {
+		t.Errorf("first call attempt = %d, want 0", observerCalls[0].Attempt)
+	}
+	if observerCalls[1].Attempt != 1 {
+		t.Errorf("second call attempt = %d, want 1", observerCalls[1].Attempt)
+	}
+	if observerCalls[0].Delay <= 0 {
+		t.Error("delay should be > 0")
+	}
+	if observerCalls[0].Err == nil {
+		t.Error("err should not be nil")
+	}
+}
+
+func TestWithRetry_ObserverNotCalledOnSuccess(t *testing.T) {
+	calls := 0
+	observerCalled := false
+	withRetry(t.Context(), 2, func(attempt int, err error, delay time.Duration) {
+		observerCalled = true
+	}, func() (string, error) {
+		calls++
+		return "ok", nil
+	})
+	if observerCalled {
+		t.Error("observer should not be called when there are no retries")
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1", calls)
+	}
+}
+
+func TestGenerateText_WithRetryObserver(t *testing.T) {
+	calls := 0
+	var observerCalls []RetryInfo
+	model := &mockModel{
+		id: "test",
+		generateFn: func(_ context.Context, _ provider.GenerateParams) (*provider.GenerateResult, error) {
+			calls++
+			if calls == 1 {
+				return nil, &APIError{StatusCode: http.StatusTooManyRequests, IsRetryable: true, Message: "rate limited"}
+			}
+			return &provider.GenerateResult{Text: "ok", FinishReason: provider.FinishStop}, nil
+		},
+	}
+
+	result, err := GenerateText(t.Context(), model, WithPrompt("hi"), WithMaxRetries(2), WithRetryObserver(func(attempt int, err error, delay time.Duration) {
+		observerCalls = append(observerCalls, RetryInfo{Attempt: attempt, Err: err, Delay: delay})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "ok" {
+		t.Errorf("Text = %q", result.Text)
+	}
+	if calls != 2 {
+		t.Errorf("calls = %d, want 2", calls)
+	}
+	if len(observerCalls) != 1 {
+		t.Fatalf("observerCalls = %d, want 1", len(observerCalls))
+	}
+	if observerCalls[0].Attempt != 0 {
+		t.Errorf("attempt = %d, want 0", observerCalls[0].Attempt)
+	}
+}
+
+type RetryInfo struct {
+	Attempt int
+	Err     error
+	Delay   time.Duration
 }

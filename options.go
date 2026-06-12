@@ -145,6 +145,9 @@ type options struct {
 	// StateRef, when non-nil, receives atomic state updates as the tool loop
 	// progresses. See WithStateRef / AgentState.
 	StateRef *AgentState
+
+	// RetryObserver is called before each retry attempt. See WithRetryObserver.
+	RetryObserver RetryObserver
 }
 
 // defaultOptions returns options with sensible defaults.
@@ -322,6 +325,14 @@ func WithEmbeddingProviderOptions(opts map[string]any) Option {
 	return func(o *options) {
 		o.EmbeddingProviderOptions = opts
 	}
+}
+
+// WithRetryObserver sets a callback that is invoked before each retry attempt.
+// The callback receives the 0-based retry attempt number, the error that triggered
+// the retry, and the delay before the next attempt. It is called before the sleep,
+// allowing callers to log or observe retry progress.
+func WithRetryObserver(fn RetryObserver) Option {
+	return func(o *options) { o.RetryObserver = fn }
 }
 
 // validateProviderOptions panics if any value in the map is not JSON-serializable.

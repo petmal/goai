@@ -677,7 +677,7 @@ func streamWithToolLoop(ctx context.Context, model provider.LanguageModel, o opt
 	}
 
 	start := time.Now()
-	firstResult, streamErr := withRetry(ctx, o.MaxRetries, func() (*provider.StreamResult, error) {
+	firstResult, streamErr := withRetry(ctx, o.MaxRetries, o.RetryObserver, func() (*provider.StreamResult, error) {
 		return model.DoStream(ctx, params)
 	})
 	if streamErr != nil {
@@ -830,7 +830,7 @@ func streamWithToolLoop(ctx context.Context, model provider.LanguageModel, o opt
 				o.StateRef.set(StepLLMInFlight, step)
 				highestInflightStep = step
 				var err error
-				result, err = withRetry(ctx, o.MaxRetries, func() (*provider.StreamResult, error) {
+				result, err = withRetry(ctx, o.MaxRetries, o.RetryObserver, func() (*provider.StreamResult, error) {
 					return model.DoStream(ctx, params)
 				})
 				if err != nil {
@@ -1122,7 +1122,7 @@ func StreamText(ctx context.Context, model provider.LanguageModel, opts ...Optio
 	}
 
 	start := time.Now()
-	result, streamErr := withRetry(ctx, o.MaxRetries, func() (*provider.StreamResult, error) {
+	result, streamErr := withRetry(ctx, o.MaxRetries, o.RetryObserver, func() (*provider.StreamResult, error) {
 		return model.DoStream(ctx, params)
 	})
 	if streamErr != nil {
@@ -1263,7 +1263,7 @@ func GenerateText(ctx context.Context, model provider.LanguageModel, opts ...Opt
 		start := time.Now()
 		o.StateRef.set(StepLLMInFlight, step)
 		highestInflightStep = step
-		result, err := withRetry(ctx, o.MaxRetries, func() (*provider.GenerateResult, error) {
+		result, err := withRetry(ctx, o.MaxRetries, o.RetryObserver, func() (*provider.GenerateResult, error) {
 			return model.DoGenerate(ctx, params)
 		})
 

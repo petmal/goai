@@ -464,7 +464,7 @@ func GenerateObject[T any](ctx context.Context, model provider.LanguageModel, op
 		}
 
 		start := time.Now()
-		result, err := withRetry(ctx, o.MaxRetries, func() (*provider.GenerateResult, error) {
+		result, err := withRetry(ctx, o.MaxRetries, o.RetryObserver, func() (*provider.GenerateResult, error) {
 			return model.DoGenerate(ctx, params)
 		})
 
@@ -643,7 +643,7 @@ func StreamObject[T any](ctx context.Context, model provider.LanguageModel, opts
 	}
 
 	start := time.Now()
-	result, streamErr := withRetry(ctx, o.MaxRetries, func() (*provider.StreamResult, error) {
+	result, streamErr := withRetry(ctx, o.MaxRetries, o.RetryObserver, func() (*provider.StreamResult, error) {
 		return model.DoStream(ctx, params)
 	})
 	if streamErr != nil {
