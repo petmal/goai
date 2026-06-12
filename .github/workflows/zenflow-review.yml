@@ -1,10 +1,9 @@
 name: zenflow PR review
 
-# Comment-triggered AI code review using zenflow + Google Gemini
-# (gemini-3-flash-preview). Repo maintainers post `/zenflow-review` on a
-# PR to trigger a two-reviewer pass (Go idiomatics + security) that
-# synthesises into a single PR comment. See .zenflow/pr-review.yaml for
-# the workflow spec.
+# Comment-triggered AI code review using zenflow + FPT Cloud Qwen3.6-27B.
+# Repo maintainers post `/zenflow-review` on a PR to trigger a two-reviewer
+# pass (Go idiomatics + security) that synthesises into a single PR comment.
+# See .zenflow/pr-review.yaml for the workflow spec.
 
 on:
   issue_comment:
@@ -53,7 +52,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: "1.25"
 
       - name: Install zenflow
         run: go install github.com/zendev-sh/zenflow/cmd/zenflow@v0.1.5
@@ -64,10 +63,10 @@ jobs:
           gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" > .zenflow/diff.patch
           wc -l .zenflow/diff.patch
 
-      - name: Run zenflow review
-        env:
-          ZENFLOW_MODEL: google/gemini-3-flash-preview
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+       - name: Run zenflow review
+         env:
+           ZENFLOW_MODEL: fptcloud/Qwen3.6-27B
+           FPT_API_KEY: ${{ secrets.FPT_API_KEY }}
         run: |
           # --sandbox grants the safe tool set (read, write, grep, glob)
           # without bash. Without an explicit permission flag zenflow
