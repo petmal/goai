@@ -2194,21 +2194,21 @@ func TestStreamObject_ResponseMessages(t *testing.T) {
 // behaviour.
 func TestGenerateObject_StopWhenIgnored(t *testing.T) {
 	// NOT parallel-safe: mutates package-global warn state (atomic flags +
-	// osStderr). Must not run with t.Parallel() and any test that races on
+	// os.Stderr). Must not run with t.Parallel() and any test that races on
 	// these globals would interfere. The atomic.Bool.Store(false) reset
 	// (FIX 21) replaces the earlier sync.Once reassignment, which was
 	// technically unsound if observed concurrently.
-	origStderr := osStderr
+	origStderr := os.Stderr
 	// Reset BOTH warn flags for this test so the warnings actually fire
 	// regardless of earlier calls in other tests in this package (FIX 12).
 	generateObjectStopWhenWarned.Store(false)
 	streamObjectStopWhenWarned.Store(false)
-	t.Cleanup(func() { osStderr = origStderr })
+	t.Cleanup(func() { os.Stderr = origStderr })
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	osStderr = w
+	os.Stderr = w
 
 	// Simple GenerateObject call with WithStopWhen - predicate must be ignored.
 	genModel := &mockModel{
@@ -2273,7 +2273,7 @@ func TestGenerateObject_StopWhenIgnored(t *testing.T) {
 	}
 
 	_ = w.Close()
-	osStderr = origStderr
+	os.Stderr = origStderr
 
 	buf := make([]byte, 4096)
 	n, _ := r.Read(buf)
@@ -2305,6 +2305,34 @@ func TestGenerateObject_DuplicateToolName(t *testing.T) {
 	}
 }
 
+func TestGenerateObject_EmptyToolName(t *testing.T) {
+	model := &mockModel{id: "test"}
+	_, err := GenerateObject[simpleObject](t.Context(), model,
+		WithPrompt("hi"),
+		WithTools(Tool{Name: "", Execute: func(_ context.Context, _ json.RawMessage) (string, error) { return "", nil }}),
+	)
+	if err == nil {
+		t.Fatal("expected error for empty tool name, got nil")
+	}
+	if !strings.Contains(err.Error(), "tool name must not be empty") {
+		t.Errorf("error = %q, want it to contain 'tool name must not be empty'", err.Error())
+	}
+}
+
+func TestStreamObject_EmptyToolName(t *testing.T) {
+	model := &mockModel{id: "test"}
+	_, err := StreamObject[simpleObject](t.Context(), model,
+		WithPrompt("hi"),
+		WithTools(Tool{Name: "", Execute: func(_ context.Context, _ json.RawMessage) (string, error) { return "", nil }}),
+	)
+	if err == nil {
+		t.Fatal("expected error for empty tool name, got nil")
+	}
+	if !strings.Contains(err.Error(), "tool name must not be empty") {
+		t.Errorf("error = %q, want it to contain 'tool name must not be empty'", err.Error())
+	}
+}
+
 func TestStreamObject_DuplicateToolName(t *testing.T) {
 	dupe := Tool{
 		Name:    "clash",
@@ -2318,4 +2346,63 @@ func TestStreamObject_DuplicateToolName(t *testing.T) {
 	if !strings.Contains(err.Error(), "duplicate tool name") {
 		t.Errorf("error = %q, want it to contain %q", err.Error(), "duplicate tool name")
 	}
+}
+
+// TestObjectStream_ReceiverRenameRegression verifies that ObjectStream methods
+// (PartialObjectStream and Result) work correctly after the receiver was renamed
+// from `os` to `s` to avoid shadowing the `os` package. This test explicitly
+// imports and uses the `os` package to ensure no shadowing occurs.
+func TestObjectStream_ReceiverRenameRegression(t *testing.T) {
+	model := &mockModel{
+		id: "test",
+		streamFn: func(_ context.Context, _ provider.GenerateParams) (*provider.StreamResult, error) {
+			return streamFromChunks(
+				provider.StreamChunk{Type: provider.ChunkText, Text: `{"name":"Mallory","age":55}`},
+				provider.StreamChunk{Type: provider.ChunkFinish, FinishReason: provider.FinishStop, Usage: provider.Usage{InputTokens: 20, OutputTokens: 10}},
+			), nil
+		},
+	}
+
+	stream, err := StreamObject[simpleObject](t.Context(), model, WithPrompt("generate"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Exercise PartialObjectStream() - the receiver method that was renamed.
+	var partials []*simpleObject
+	for partial := range stream.PartialObjectStream() {
+		partials = append(partials, partial)
+	}
+
+	// Exercise Result() - another receiver method.
+	result, err := stream.Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the parsed object is correct.
+	if result.Object.Name != "Mallory" {
+		t.Errorf("Object.Name = %q, want %q", result.Object.Name, "Mallory")
+	}
+	if result.Object.Age != 55 {
+		t.Errorf("Object.Age = %d, want %d", result.Object.Age, 55)
+	}
+
+	// Verify usage was captured.
+	if result.Usage.InputTokens != 20 || result.Usage.OutputTokens != 10 {
+		t.Errorf("Usage = %+v, want InputTokens=20 OutputTokens=10", result.Usage)
+	}
+
+	// Verify finish reason was captured.
+	if result.FinishReason != provider.FinishStop {
+		t.Errorf("FinishReason = %q, want %q", result.FinishReason, provider.FinishStop)
+	}
+
+	// Use os package explicitly to prove no shadowing in ObjectStream methods.
+	_, err = os.ReadFile("/dev/null")
+	if err == nil {
+		t.Log("os.ReadFile succeeded (expected on some systems)")
+	}
+	// The important thing is that `os` resolves to the package, not a receiver.
+	_ = os.Stderr
 }

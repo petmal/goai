@@ -1943,13 +1943,13 @@ func TestStepKind_String(t *testing.T) {
 // object_test.go that exercise the public WithStopWhen option.
 func TestDefaultWarnStopWhenIgnored_AllBranches(t *testing.T) {
 	streamObjectStopWhenWarned.Store(false)
-	origStderr := osStderr
+	origStderr := os.Stderr
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
 	}
-	osStderr = w
-	t.Cleanup(func() { osStderr = origStderr })
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = origStderr })
 
 	defaultWarnStopWhenIgnoredForObject("StreamObject")
 	defaultWarnStopWhenIgnoredForObject("StreamObject")
@@ -1974,13 +1974,13 @@ func TestDefaultWarnStopWhenIgnored_AllBranches(t *testing.T) {
 // TestGenerateObject_StateRefWarn_OnceDefault.
 func TestDefaultWarnStateRefIgnored_AllBranches(t *testing.T) {
 	streamObjectStateRefWarned.Store(false)
-	origStderr := osStderr
+	origStderr := os.Stderr
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
 	}
-	osStderr = w
-	t.Cleanup(func() { osStderr = origStderr })
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = origStderr })
 
 	// StreamObject branch - CAS once.
 	defaultWarnStateRefIgnoredForObject("StreamObject")
@@ -2004,21 +2004,21 @@ func TestDefaultWarnStateRefIgnored_AllBranches(t *testing.T) {
 
 // TestGenerateObject_StateRefWarn_OnceDefault exercises the real
 // defaultWarnStateRefIgnoredForObject path and verifies the CAS-guarded
-// once-per-process semantics by redirecting osStderr to a pipe.
+// once-per-process semantics by redirecting os.Stderr to a pipe.
 func TestGenerateObject_StateRefWarn_OnceDefault(t *testing.T) {
 	// Reset both once flags so counters start clean. Matches FIX 33
 	// reset caveat: no t.Parallel() on this or its siblings.
 	generateObjectStateRefWarned.Store(false)
 	streamObjectStateRefWarned.Store(false)
 
-	// Swap osStderr for a pipe so we can capture writes.
-	origStderr := osStderr
+	// Swap os.Stderr for a pipe so we can capture writes.
+	origStderr := os.Stderr
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
 	}
-	osStderr = w
-	t.Cleanup(func() { osStderr = origStderr })
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = origStderr })
 
 	// Call the default warn twice; second call must be a no-op.
 	defaultWarnStateRefIgnoredForObject("GenerateObject")
@@ -2160,13 +2160,13 @@ func TestGenerateObject_BothWarnings_FireOnceEach_WhenBothPassed(t *testing.T) {
 	generateObjectStopWhenWarned.Store(false)
 	generateObjectStateRefWarned.Store(false)
 
-	origStderr := osStderr
+	origStderr := os.Stderr
 	r, w, perr := os.Pipe()
 	if perr != nil {
 		t.Fatalf("pipe: %v", perr)
 	}
-	osStderr = w
-	t.Cleanup(func() { osStderr = origStderr })
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = origStderr })
 
 	model := &mockModel{
 		id: "t",
@@ -2214,13 +2214,13 @@ func TestStreamObject_BothWarnings_FireOnceEach_WhenBothPassed(t *testing.T) {
 	streamObjectStopWhenWarned.Store(false)
 	streamObjectStateRefWarned.Store(false)
 
-	origStderr := osStderr
+	origStderr := os.Stderr
 	r, w, perr := os.Pipe()
 	if perr != nil {
 		t.Fatalf("pipe: %v", perr)
 	}
-	osStderr = w
-	t.Cleanup(func() { osStderr = origStderr })
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = origStderr })
 
 	model := &mockModel{
 		id: "t",
@@ -2276,13 +2276,13 @@ func TestGenerateObject_Warnings_LatchesAreIndependent(t *testing.T) {
 	generateObjectStopWhenWarned.Store(false)
 	generateObjectStateRefWarned.Store(false)
 
-	origStderr := osStderr
+	origStderr := os.Stderr
 	r, w, perr := os.Pipe()
 	if perr != nil {
 		t.Fatalf("pipe: %v", perr)
 	}
-	osStderr = w
-	t.Cleanup(func() { osStderr = origStderr })
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = origStderr })
 
 	model := &mockModel{
 		id: "t",
@@ -2333,13 +2333,13 @@ func TestStreamObject_Warnings_LatchesAreIndependent(t *testing.T) {
 	streamObjectStopWhenWarned.Store(false)
 	streamObjectStateRefWarned.Store(false)
 
-	origStderr := osStderr
+	origStderr := os.Stderr
 	r, w, perr := os.Pipe()
 	if perr != nil {
 		t.Fatalf("pipe: %v", perr)
 	}
-	osStderr = w
-	t.Cleanup(func() { osStderr = origStderr })
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = origStderr })
 
 	model := &mockModel{
 		id: "t",

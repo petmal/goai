@@ -16,10 +16,6 @@ import (
 	"github.com/zendev-sh/goai/provider"
 )
 
-// osStderr holds os.Stderr at package level so ObjectStream methods can write to
-// stderr despite their receiver being named "os", which shadows the os package.
-var osStderr = os.Stderr
-
 // Per-function once flags for GenerateObject and StreamObject warnings
 // (FIX 12). A single package-global once would fire only once total across
 // both functions, silencing the warning for whichever function is called
@@ -63,16 +59,16 @@ func defaultWarnStopWhenIgnoredForObject(fn string) {
 	switch fn {
 	case "GenerateObject":
 		if generateObjectStopWhenWarned.CompareAndSwap(false, true) {
-			_, _ = fmt.Fprint(osStderr, msg)
+			_, _ = fmt.Fprint(os.Stderr, msg)
 		}
 	case "StreamObject":
 		if streamObjectStopWhenWarned.CompareAndSwap(false, true) {
-			_, _ = fmt.Fprint(osStderr, msg)
+			_, _ = fmt.Fprint(os.Stderr, msg)
 		}
 	default:
 		// Unknown call site: print once per call (should never happen - all
 		// call sites pass a hard-coded literal).
-		_, _ = fmt.Fprint(osStderr, msg)
+		_, _ = fmt.Fprint(os.Stderr, msg)
 	}
 }
 
@@ -87,14 +83,14 @@ func defaultWarnStateRefIgnoredForObject(fn string) {
 	switch fn {
 	case "GenerateObject":
 		if generateObjectStateRefWarned.CompareAndSwap(false, true) {
-			_, _ = fmt.Fprint(osStderr, msg)
+			_, _ = fmt.Fprint(os.Stderr, msg)
 		}
 	case "StreamObject":
 		if streamObjectStateRefWarned.CompareAndSwap(false, true) {
-			_, _ = fmt.Fprint(osStderr, msg)
+			_, _ = fmt.Fprint(os.Stderr, msg)
 		}
 	default:
-		_, _ = fmt.Fprint(osStderr, msg)
+		_, _ = fmt.Fprint(os.Stderr, msg)
 	}
 }
 
@@ -169,14 +165,14 @@ func newObjectStream[T any](ctx context.Context, source <-chan provider.StreamCh
 // PartialObjectStream returns a channel that emits partial objects as JSON accumulates.
 // Each emitted value has progressively more fields populated.
 // Mutually exclusive with Result() - only call one consumption method first.
-func (os *ObjectStream[T]) PartialObjectStream() <-chan *T {
+func (s *ObjectStream[T]) PartialObjectStream() <-chan *T {
 	ch := make(chan *T, 64)
-	os.consumeOnce.Do(func() {
-		os.partialCh = ch
-		go os.consume(ch)
+	s.consumeOnce.Do(func() {
+		s.partialCh = ch
+		go s.consume(ch)
 	})
-	if os.partialCh != nil {
-		return os.partialCh
+	if s.partialCh != nil {
+		return s.partialCh
 	}
 	// Called after Result() consumed the source - return closed channel.
 	close(ch)
@@ -185,42 +181,42 @@ func (os *ObjectStream[T]) PartialObjectStream() <-chan *T {
 
 // Result blocks until the stream completes and returns the final validated object.
 // Returns an error if JSON parsing of the accumulated text fails.
-func (os *ObjectStream[T]) Result() (*ObjectResult[T], error) {
-	os.consumeOnce.Do(func() {
-		go os.consume(nil)
+func (s *ObjectStream[T]) Result() (*ObjectResult[T], error) {
+	s.consumeOnce.Do(func() {
+		go s.consume(nil)
 	})
-	<-os.doneCh
+	<-s.doneCh
 
-	if os.streamErr != nil {
-		return nil, os.streamErr
+	if s.streamErr != nil {
+		return nil, s.streamErr
 	}
 
-	if os.parseErr != nil {
+	if s.parseErr != nil {
 		// Raw model output is truncated to 200 chars to limit information disclosure.
-		return nil, fmt.Errorf("parsing structured output: %w (raw: %s)", os.parseErr, truncate(os.text.String(), 200))
+		return nil, fmt.Errorf("parsing structured output: %w (raw: %s)", s.parseErr, truncate(s.text.String(), 200))
 	}
 
-	text := os.text.String()
+	text := s.text.String()
 	var responseMessages []provider.Message
 	if text != "" {
 		responseMessages = buildFinalAssistantMessages(text, nil, nil)
 	}
 
-	if os.finalObject == nil {
+	if s.finalObject == nil {
 		return &ObjectResult[T]{
-			Usage:            os.usage,
-			FinishReason:     os.finishReason,
-			Response:         os.response,
-			ProviderMetadata: os.providerMetadata,
+			Usage:            s.usage,
+			FinishReason:     s.finishReason,
+			Response:         s.response,
+			ProviderMetadata: s.providerMetadata,
 			ResponseMessages: responseMessages,
 		}, nil
 	}
 	return &ObjectResult[T]{
-		Object:           *os.finalObject,
-		Usage:            os.usage,
-		FinishReason:     os.finishReason,
-		Response:         os.response,
-		ProviderMetadata: os.providerMetadata,
+		Object:           *s.finalObject,
+		Usage:            s.usage,
+		FinishReason:     s.finishReason,
+		Response:         s.response,
+		ProviderMetadata: s.providerMetadata,
 		ResponseMessages: responseMessages,
 	}, nil
 }
@@ -229,24 +225,24 @@ func (os *ObjectStream[T]) Result() (*ObjectResult[T], error) {
 // Must be called after the stream is fully consumed (after Result(),
 // or after the PartialObjectStream() channel is drained).
 // Follows the bufio.Scanner.Err() pattern.
-func (os *ObjectStream[T]) Err() error {
-	<-os.doneCh
-	return os.streamErr
+func (s *ObjectStream[T]) Err() error {
+	<-s.doneCh
+	return s.streamErr
 }
 
-func (os *ObjectStream[T]) consume(partialOut chan<- *T) {
-	defer close(os.doneCh)
+func (s *ObjectStream[T]) consume(partialOut chan<- *T) {
+	defer close(s.doneCh)
 	// Surface a panic from any user hook fired during teardown (OnStepFinish,
 	// OnResponse, OnFinish) through stream.Err(). Registered near the top so it
 	// runs after (LIFO) the hook defers below. A pre-existing stream error is
 	// preserved as the root cause.
-	defer recoverToStreamErr(os.onPanic, "stream", func(e error) {
-		if os.streamErr == nil {
-			os.streamErr = e
+	defer recoverToStreamErr(s.onPanic, "stream", func(e error) {
+		if s.streamErr == nil {
+			s.streamErr = e
 		}
 	})
-	if os.timeoutCancel != nil {
-		defer os.timeoutCancel()
+	if s.timeoutCancel != nil {
+		defer s.timeoutCancel()
 	}
 	if partialOut != nil {
 		defer close(partialOut)
@@ -254,12 +250,12 @@ func (os *ObjectStream[T]) consume(partialOut chan<- *T) {
 
 	// Call OnFinish hook when consume finishes (single-step streaming).
 	// Deferred BEFORE OnStepFinish so it runs AFTER it (LIFO order).
-	if len(os.onFinish) > 0 {
+	if len(s.onFinish) > 0 {
 		defer func() {
-			fireOnFinish(os.onPanic, os.onFinish, FinishInfo{
+			fireOnFinish(s.onPanic, s.onFinish, FinishInfo{
 				TotalSteps:   1,
-				TotalUsage:   os.usage,
-				FinishReason: os.finishReason,
+				TotalUsage:   s.usage,
+				FinishReason: s.finishReason,
 				StoppedBy:    provider.StopCauseNatural,
 			})
 		}()
@@ -267,67 +263,67 @@ func (os *ObjectStream[T]) consume(partialOut chan<- *T) {
 
 	// Call OnStepFinish hook when consume finishes (single-step streaming).
 	// Deferred BEFORE OnResponse so it runs AFTER it (LIFO order).
-	if len(os.onStepFinish) > 0 {
+	if len(s.onStepFinish) > 0 {
 		defer func() {
 			stepResult := StepResult{
 				Number:           1,
-				Text:             os.text.String(),
-				FinishReason:     os.finishReason,
-				Usage:            os.usage,
-				Response:         os.response,
-				ProviderMetadata: os.providerMetadata,
+				Text:             s.text.String(),
+				FinishReason:     s.finishReason,
+				Usage:            s.usage,
+				Response:         s.response,
+				ProviderMetadata: s.providerMetadata,
 			}
-			for _, fn := range os.onStepFinish {
-				callHook(os.onPanic, "OnStepFinish", func() { fn(stepResult) })
+			for _, fn := range s.onStepFinish {
+				callHook(s.onPanic, "OnStepFinish", func() { fn(stepResult) })
 			}
 		}()
 	}
 
 	// Call OnResponse hook when consume finishes (after all chunks processed).
-	if len(os.onResponse) > 0 {
+	if len(s.onResponse) > 0 {
 		defer func() {
 			info := ResponseInfo{
-				Latency:      time.Since(os.startTime),
-				Usage:        os.usage,
-				FinishReason: os.finishReason,
-				Error:        os.streamErr,
+				Latency:      time.Since(s.startTime),
+				Usage:        s.usage,
+				FinishReason: s.finishReason,
+				Error:        s.streamErr,
 			}
 			var apiErr *APIError
-			if errors.As(os.streamErr, &apiErr) {
+			if errors.As(s.streamErr, &apiErr) {
 				info.StatusCode = apiErr.StatusCode
 			}
-			for _, fn := range os.onResponse {
-				callHook(os.onPanic, "OnResponse", func() { fn(info) })
+			for _, fn := range s.onResponse {
+				callHook(s.onPanic, "OnResponse", func() { fn(info) })
 			}
 		}()
 	}
 
-	for chunk := range os.source {
+	for chunk := range s.source {
 		switch chunk.Type {
 		case provider.ChunkText:
-			os.text.WriteString(chunk.Text)
+			s.text.WriteString(chunk.Text)
 
 			// Try to parse partial JSON.
 			if partialOut != nil {
-				if partial, err := parsePartialJSON[T](os.text.String()); err == nil {
+				if partial, err := parsePartialJSON[T](s.text.String()); err == nil {
 					select {
 					case partialOut <- partial:
-					case <-os.ctx.Done():
-						os.streamErr = os.ctx.Err()
+					case <-s.ctx.Done():
+						s.streamErr = s.ctx.Err()
 						return
 					}
 				}
 			}
 
 		case provider.ChunkFinish:
-			os.finishReason = chunk.FinishReason
-			os.usage = chunk.Usage
-			os.response = chunk.Response
+			s.finishReason = chunk.FinishReason
+			s.usage = chunk.Usage
+			s.response = chunk.Response
 			// Extract provider metadata embedded in the finish chunk.
 			// openaicompat encodes it as Metadata["providerMetadata"] = map[string]map[string]any.
 			// The type assertion safely returns false for any other type (no panic).
 			if pm, ok := chunk.Metadata["providerMetadata"].(map[string]map[string]any); ok {
-				os.providerMetadata = pm
+				s.providerMetadata = pm
 			}
 			// Copy remaining flat metadata keys into Response.ProviderMetadata.
 			// Providers use this for per-response data: Anthropic ("iterations",
@@ -337,32 +333,32 @@ func (os *ObjectStream[T]) consume(partialOut chan<- *T) {
 				if k == "providerMetadata" || k == "sources" {
 					continue
 				}
-				if os.response.ProviderMetadata == nil {
-					os.response.ProviderMetadata = map[string]any{}
+				if s.response.ProviderMetadata == nil {
+					s.response.ProviderMetadata = map[string]any{}
 				}
-				os.response.ProviderMetadata[k] = v
+				s.response.ProviderMetadata[k] = v
 			}
 		case provider.ChunkError:
-			if os.streamErr == nil {
-				os.streamErr = chunk.Error
+			if s.streamErr == nil {
+				s.streamErr = chunk.Error
 			}
 		}
 		if partialOut == nil {
-			if os.ctx.Err() != nil {
-				os.streamErr = os.ctx.Err()
+			if s.ctx.Err() != nil {
+				s.streamErr = s.ctx.Err()
 				return
 			}
 		}
 	}
 
 	// Parse final result.
-	text := os.text.String()
+	text := s.text.String()
 	if text != "" {
 		var obj T
 		if err := json.Unmarshal([]byte(text), &obj); err != nil {
-			os.parseErr = err
+			s.parseErr = err
 		} else {
-			os.finalObject = &obj
+			s.finalObject = &obj
 		}
 	}
 }
@@ -661,14 +657,14 @@ func StreamObject[T any](ctx context.Context, model provider.LanguageModel, opts
 		return nil, streamErr
 	}
 
-	os := newObjectStream[T](ctx, result.Stream)
-	os.timeoutCancel = timeoutCancel
-	os.onResponse = o.OnResponse
-	os.onStepFinish = o.OnStepFinish
-	os.onFinish = o.OnFinish
-	os.onPanic = o.OnPanic
-	os.startTime = start
-	return os, nil
+	s := newObjectStream[T](ctx, result.Stream)
+	s.timeoutCancel = timeoutCancel
+	s.onResponse = o.OnResponse
+	s.onStepFinish = o.OnStepFinish
+	s.onFinish = o.OnFinish
+	s.onPanic = o.OnPanic
+	s.startTime = start
+	return s, nil
 }
 
 func truncate(s string, max int) string {

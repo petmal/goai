@@ -43,9 +43,15 @@ func SchemaFrom[T any]() json.RawMessage {
 	t := reflect.TypeFor[T]()
 	useCache := schemaMarshalFuncIsDefault()
 	if useCache {
-		if cached, ok := schemaCache.Load(t); ok {
-			return cached.(json.RawMessage)
+		cached, loaded := schemaCache.Load(t)
+		if !loaded {
+			return nil
 		}
+		if raw, ok := cached.(json.RawMessage); ok {
+			return raw
+		}
+		// Bad value in cache (should never happen in normal operation).
+		// Fall through to regenerate.
 	}
 	// Unwrap pointer types.
 	unwrapped := t

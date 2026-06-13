@@ -161,23 +161,24 @@ func EmbedMany(ctx context.Context, model provider.EmbeddingModel, values []stri
 		var wg sync.WaitGroup
 
 		for i, chunk := range chunks {
-			wg.Go(func() {
-				i, chunk := i, chunk
+			wg.Add(1)
+			go func(idx int, ch []string) {
+				defer wg.Done()
 				// Use select to avoid blocking forever if ctx is cancelled
 				// while waiting for the semaphore.
 				select {
 				case sem <- struct{}{}:
 					defer func() { <-sem }()
 				case <-ctx.Done():
-					results[i] = embedChunkResult{err: ctx.Err()}
+					results[idx] = embedChunkResult{err: ctx.Err()}
 					return
 				}
 
 				r, err := withRetry(ctx, o.MaxRetries, o.RetryObserver, func() (*provider.EmbedResult, error) {
-					return model.DoEmbed(ctx, chunk, embedParams)
+					return model.DoEmbed(ctx, ch, embedParams)
 				})
-				results[i] = embedChunkResult{result: r, err: err}
-			})
+				results[idx] = embedChunkResult{result: r, err: err}
+			}(i, chunk)
 		}
 		wg.Wait()
 	}

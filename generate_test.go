@@ -4210,7 +4210,7 @@ func TestBuildToolMap_EmptyToolName(t *testing.T) {
 		},
 	}
 
-	result, err := GenerateText(t.Context(), model,
+	_, err := GenerateText(t.Context(), model,
 		WithPrompt("hi"),
 		WithTools(
 			Tool{
@@ -4223,14 +4223,14 @@ func TestBuildToolMap_EmptyToolName(t *testing.T) {
 			},
 		),
 	)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		t.Fatal("expected error for empty tool name, got nil")
 	}
-	if !called {
-		t.Error("model generateFn was not called")
+	if !strings.Contains(err.Error(), "tool name must not be empty") {
+		t.Errorf("error = %q, want it to contain 'tool name must not be empty'", err.Error())
 	}
-	if result.Text != "done" {
-		t.Errorf("Text = %q, want %q", result.Text, "done")
+	if called {
+		t.Error("model generateFn should not have been called")
 	}
 }
 

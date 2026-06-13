@@ -749,3 +749,30 @@ func TestSchemaFrom_MarshalFailurePanics(t *testing.T) {
 	}()
 	SchemaFrom[Person]()
 }
+
+// TestSchemaFrom_CacheBadValueDoesNotPanic verifies that storing a non-json.RawMessage
+// value in schemaCache does not cause a panic. The ok check at schema.go:46-50 guards
+// against a bad type assertion: when the cached value cannot be asserted to
+// json.RawMessage, the function should handle it gracefully.
+func TestSchemaFrom_CacheBadValueDoesNotPanic(t *testing.T) {
+	type BadCacheType struct {
+		Value int `json:"value"`
+	}
+
+	// Store a bad value (not json.RawMessage) in the cache for this type.
+	typeKey := reflect.TypeFor[BadCacheType]()
+	schemaCache.Store(typeKey, "not a json.RawMessage")
+
+	defer func() {
+		schemaCache.Delete(typeKey)
+	}()
+
+	// SchemaFrom should not panic when the cached value is not json.RawMessage.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("SchemaFrom panicked with bad cache value: %v", r)
+		}
+	}()
+
+	_ = SchemaFrom[BadCacheType]()
+}

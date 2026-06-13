@@ -43,8 +43,11 @@ func isNetworkError(err error) bool {
 	if errors.As(err, &netErr) {
 		return true
 	}
-	// Fallback: string match for common network error messages that may be
-	// wrapped in ways that don't implement net.Error.
+	// Best-effort fallback: string match for common network error messages that
+	// may be wrapped in ways that don't implement net.Error. This is a safety
+	// net for edge cases; the net.Error check above covers the majority of
+	// transient network failures. Some matched strings (e.g. "connection reset
+	// by peer" / ECONNRESET) may overlap with net.Error on certain platforms.
 	msg := err.Error()
 	return strings.Contains(msg, "connection reset by peer") ||
 		strings.Contains(msg, "connection refused") ||

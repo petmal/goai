@@ -1332,3 +1332,64 @@ func TestEmbedMany_NilModel(t *testing.T) {
 		t.Errorf("error = %q, want it to contain %q", err.Error(), want)
 	}
 }
+
+// TestEmbedMany_ParallelChunksAllCollectedInOrder verifies that the parallel
+// goroutine path (embed.go:159-183, wg.Add(1) + go func) correctly collects
+// all embeddings from multiple chunks and preserves input order.
+// maxPerCall=1 with 8 values forces 8 chunks; WithMaxParallelCalls(3) limits
+// concurrency to 3 goroutines at a time.
+func TestEmbedMany_ParallelChunksAllCollectedInOrder(t *testing.T) {
+	model := &mockEmbeddingModel{
+		modelID:    "test-embed",
+		maxPerCall: 1, // each chunk is 1 value → 8 chunks for 8 values
+		embedFn: func(_ context.Context, values []string) (*provider.EmbedResult, error) {
+			// Return deterministic embedding based on input value length.
+			embeddings := make([][]float64, len(values))
+			for i, v := range values {
+				embeddings[i] = []float64{float64(len(v))}
+			}
+			return &provider.EmbedResult{
+				Embeddings: embeddings,
+				Usage:      provider.Usage{InputTokens: 1},
+			}, nil
+		},
+	}
+
+	// 8 values with distinct lengths to verify order preservation.
+	values := []string{"a", "bb", "ccc", "dddd", "eeeee", "ffffff", "ggggggg", "hhhhhhhh"}
+	result, err := EmbedMany(t.Context(), model, values, WithMaxParallelCalls(3))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// All 8 embeddings must be present.
+	if len(result.Embeddings) != 8 {
+		t.Fatalf("expected 8 embeddings, got %d", len(result.Embeddings))
+	}
+
+	// Verify order: embedding[i][0] == len(values[i]).
+	expected := []float64{1, 2, 3, 4, 5, 6, 7, 8}
+	for i, emb := range result.Embeddings {
+		if len(emb) == 0 {
+			t.Fatalf("embedding[%d] is empty", i)
+		}
+		if emb[0] != expected[i] {
+			t.Errorf("embedding[%d] = %v, want [%f] (length of %q)", i, emb, expected[i], values[i])
+		}
+	}
+
+	// Verify all 8 chunks were processed (8 calls to DoEmbed).
+	calls := model.callCount.Load()
+	if calls != 8 {
+		t.Errorf("expected 8 DoEmbed calls, got %d", calls)
+	}
+
+	// Verify concurrency was capped at 3.
+	peak := model.concurrentPeak.Load()
+	if peak > 3 {
+		t.Errorf("peak concurrency = %d, want <= 3", peak)
+	}
+	if peak < 2 {
+		t.Errorf("expected peak concurrency >= 2, got %d", peak)
+	}
+}
