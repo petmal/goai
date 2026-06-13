@@ -2,9 +2,7 @@ package goai
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"maps"
 	"slices"
 	"time"
