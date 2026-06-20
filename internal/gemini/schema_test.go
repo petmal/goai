@@ -369,6 +369,60 @@ func TestSanitizeSchema_PointerToStructNullableType(t *testing.T) {
 	}
 }
 
+func TestSanitizeSchema_StripsUnsupportedKeywords(t *testing.T) {
+	// Gemini's function_declarations rejects propertyNames, patternProperties,
+	// const, exclusiveMinimum, exclusiveMaximum, and default.
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"name": map[string]any{
+				"type":             "string",
+				"const":            "fixed",
+				"default":          "hello",
+				"exclusiveMinimum": 0,
+				"exclusiveMaximum": 100,
+			},
+			"meta": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"key": map[string]any{"type": "string"},
+				},
+				"propertyNames": map[string]any{
+					"pattern": "^[a-zA-Z]+$",
+				},
+				"patternProperties": map[string]any{
+					"^x-": map[string]any{"type": "string"},
+				},
+			},
+		},
+	}
+	result := SanitizeSchema(schema)
+
+	props := result["properties"].(map[string]any)
+
+	// name: const, default, exclusiveMinimum, exclusiveMaximum removed.
+	name := props["name"].(map[string]any)
+	for _, k := range []string{"const", "default", "exclusiveMinimum", "exclusiveMaximum"} {
+		if _, ok := name[k]; ok {
+			t.Errorf("name.%s should be removed", k)
+		}
+	}
+	if name["type"] != "string" {
+		t.Errorf("name.type = %v, want string", name["type"])
+	}
+
+	// meta: propertyNames, patternProperties removed.
+	meta := props["meta"].(map[string]any)
+	for _, k := range []string{"propertyNames", "patternProperties"} {
+		if _, ok := meta[k]; ok {
+			t.Errorf("meta.%s should be removed", k)
+		}
+	}
+	if meta["type"] != "object" {
+		t.Errorf("meta.type = %v, want object", meta["type"])
+	}
+}
+
 func TestSanitizeSchema_TimeDateTimeFormat(t *testing.T) {
 	// time.Time produces type: "string", format: "date-time".
 	// Gemini doesn't support format, so it should be stripped.

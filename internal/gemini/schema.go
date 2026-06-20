@@ -227,9 +227,15 @@ func sanitizeImpl(obj any) any {
 		delete(result, "required")
 	}
 
-	// Gemini API does not support additionalProperties or format in JSON Schema.
+	// Gemini API does not support these JSON Schema keywords in function_declarations.
 	delete(result, "additionalProperties")
 	delete(result, "format")
+	delete(result, "propertyNames")
+	delete(result, "patternProperties")
+	delete(result, "const")
+	delete(result, "exclusiveMinimum")
+	delete(result, "exclusiveMaximum")
+	delete(result, "default")
 
 	return result
 }
