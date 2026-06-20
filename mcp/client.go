@@ -186,9 +186,12 @@ func (c *Client) CallTool(ctx context.Context, name string, args map[string]any)
 	if err := c.assertCapability("tools"); err != nil {
 		return nil, err
 	}
+	if args == nil {
+		args = make(map[string]any)
+	}
 	params := struct {
 		Name      string         `json:"name"`
-		Arguments map[string]any `json:"arguments,omitempty"`
+		Arguments map[string]any `json:"arguments"`
 	}{
 		Name:      name,
 		Arguments: args,

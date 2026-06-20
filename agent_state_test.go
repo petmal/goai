@@ -2524,114 +2524,105 @@ func TestAgentState_StreamText_ErrorAfterLLMInFlight_MonotonicStep(t *testing.T)
 		}
 	})
 
-	// FIX 50: the single-shot (MaxSteps=1) race subtest above is tautological
-	// for the load-bearing monotonicity path - a single-shot failure has
-	// highestInflightStep == len(steps) (both effectively 1), so the
-	// `highestInflightStep > finalStep` branch in the StepIdle defer is
-	// never exercised. This subtest exercises the genuine mid-loop case:
-	// step 1 succeeds with a tool call (steps gets length 1), then step 2's
-	// DoStream errors BEFORE a StepResult is appended (len(steps) stays 1,
-	// highestInflightStep reaches 2). Pollers must observe step monotonically
-	// advance from 1 → 2 at Idle, never regressing.
-	t.Run("race/mid-loop-error-monotonic-step", func(t *testing.T) {
-		for trial := 0; trial < 50; trial++ {
-			var callCount atomic.Int32
-			model := &mockModel{
-				id: "t",
-				streamFn: func(_ context.Context, _ provider.GenerateParams) (*provider.StreamResult, error) {
-					n := callCount.Add(1)
-					if n == 1 {
-						// Step 1: success with one tool call → tool executes,
-						// loop proceeds to step 2.
-						return streamFromChunks(
-							provider.StreamChunk{Type: provider.ChunkToolCall, ToolCallID: "tc1", ToolName: "ping", ToolInput: `{}`},
-							provider.StreamChunk{Type: provider.ChunkFinish, FinishReason: provider.FinishToolCalls},
-						), nil
-					}
-					// Step 2+: DoStream itself fails (error before any StepResult).
-					return nil, errors.New("step2 upstream refused")
-				},
-			}
-			var state AgentState
-			var pollerWG sync.WaitGroup
-			stop := make(chan struct{})
-			var violated atomic.Bool
-			var maxObserved atomic.Int32
-			for i := 0; i < 8; i++ {
-				pollerWG.Add(1)
-				go func() {
-					defer pollerWG.Done()
-					var lastStep int
-					for {
-						select {
-						case <-stop:
-							return
-						default:
+		// FIX 50: the single-shot (MaxSteps=1) race subtest above is tautological
+		// for the load-bearing monotonicity path - a single-shot failure has
+		// highestInflightStep == len(steps) (both effectively 1), so the
+		// `highestInflightStep > finalStep` branch in the StepIdle defer is
+		// never exercised. This subtest exercises the genuine mid-loop case:
+		// step 1 succeeds with a tool call (steps gets length 1), then step 2's
+		// DoStream errors BEFORE a StepResult is appended (len(steps) stays 1,
+		// highestInflightStep reaches 2). Pollers must observe step monotonically
+		// advance from 1 → 2 at Idle, never regressing.
+		t.Run("race/mid-loop-error-monotonic-step", func(t *testing.T) {
+			for trial := 0; trial < 50; trial++ {
+				var callCount atomic.Int32
+				model := &mockModel{
+					id: "t",
+					streamFn: func(_ context.Context, _ provider.GenerateParams) (*provider.StreamResult, error) {
+						n := callCount.Add(1)
+						if n == 1 {
+							// Step 1: success with one tool call → tool executes,
+							// loop proceeds to step 2.
+							return streamFromChunks(
+								provider.StreamChunk{Type: provider.ChunkToolCall, ToolCallID: "tc1", ToolName: "ping", ToolInput: `{}`},
+								provider.StreamChunk{Type: provider.ChunkFinish, FinishReason: provider.FinishToolCalls},
+							), nil
 						}
-						_, s := state.Observe()
-						if s < lastStep {
-							violated.Store(true)
-							return
-						}
-						if int32(s) > maxObserved.Load() {
-							maxObserved.Store(int32(s))
-						}
-						lastStep = s
-					}
-				}()
-			}
-			stream, err := StreamText(t.Context(), model,
-				WithPrompt("go"),
-				WithMaxSteps(3),
-				WithTools(Tool{
-					Name:        "ping",
-					Description: "ping",
-					InputSchema: json.RawMessage(`{"type":"object"}`),
-					Execute: func(_ context.Context, _ json.RawMessage) (string, error) {
-						return "pong", nil
+						// Step 2+: DoStream itself fails (error before any StepResult).
+						return nil, errors.New("step2 upstream refused")
 					},
-				}),
-				WithStateRef(&state),
-			)
-			// StreamText returns (stream, nil) even if a subsequent step
-			// errors - the error surfaces via ChunkError inside the stream.
-			if err != nil {
-				// Unexpected: step 1 succeeded so StreamText should have
-				// returned a live stream.
+				}
+				var state AgentState
+				var pollerWG sync.WaitGroup
+				stop := make(chan struct{})
+				var violated atomic.Bool
+				for i := 0; i < 8; i++ {
+					pollerWG.Add(1)
+					go func() {
+						defer pollerWG.Done()
+						var lastStep int
+						for {
+							select {
+							case <-stop:
+								return
+							default:
+							}
+							_, s := state.Observe()
+							if s < lastStep {
+								violated.Store(true)
+								return
+							}
+							lastStep = s
+						}
+					}()
+				}
+				stream, err := StreamText(t.Context(), model,
+					WithPrompt("go"),
+					WithMaxSteps(3),
+					WithTools(Tool{
+						Name:        "ping",
+						Description: "ping",
+						InputSchema: json.RawMessage(`{"type":"object"}`),
+						Execute: func(_ context.Context, _ json.RawMessage) (string, error) {
+							return "pong", nil
+						},
+					}),
+					WithStateRef(&state),
+				)
+				// StreamText returns (stream, nil) even if a subsequent step
+				// errors - the error surfaces via ChunkError inside the stream.
+				if err != nil {
+					// Unexpected: step 1 succeeded so StreamText should have
+					// returned a live stream.
+					close(stop)
+					pollerWG.Wait()
+					t.Fatalf("trial %d: unexpected initial StreamText error: %v", trial, err)
+				}
+				// Drain the stream so the background goroutine completes and
+				// publishes StepIdle. Without this, the tool-loop goroutine is
+				// still running when we check final state below.
+				for range stream.Stream() {
+				}
+				// Additionally wait for the done signal - raw channel close
+				// fires BEFORE StepIdle store (documented in WithStateRef godoc).
+				_ = stream.Err()
 				close(stop)
 				pollerWG.Wait()
-				t.Fatalf("trial %d: unexpected initial StreamText error: %v", trial, err)
+				if violated.Load() {
+					t.Fatalf("trial %d: poller observed step regression across LLMInFlight→Idle transition", trial)
+				}
+				kind, finalStep := state.Observe()
+				if kind != StepIdle {
+					t.Errorf("trial %d: final kind=%v; want StepIdle", trial, kind)
+				}
+				// FIX 47 invariant: finalStep must reflect the highest
+				// announced in-flight step (2), NOT len(steps) (which is 1
+				// because step 2 erred before a StepResult was appended).
+				if finalStep < 2 {
+					t.Errorf("trial %d: finalStep=%d; want >= 2 (highestInflightStep tracked step-2 announcement)", trial, finalStep)
+				}
 			}
-			// Drain the stream so the background goroutine completes and
-			// publishes StepIdle. Without this, the tool-loop goroutine is
-			// still running when we check final state below.
-			for range stream.Stream() {
-			}
-			// Additionally wait for the done signal - raw channel close
-			// fires BEFORE StepIdle store (documented in WithStateRef godoc).
-			_ = stream.Err()
-			close(stop)
-			pollerWG.Wait()
-			if violated.Load() {
-				t.Fatalf("trial %d: poller observed step regression across LLMInFlight→Idle transition", trial)
-			}
-			kind, finalStep := state.Observe()
-			if kind != StepIdle {
-				t.Errorf("trial %d: final kind=%v; want StepIdle", trial, kind)
-			}
-			// FIX 47 invariant: finalStep must reflect the highest
-			// announced in-flight step (2), NOT len(steps) (which is 1
-			// because step 2 erred before a StepResult was appended).
-			if finalStep < 2 {
-				t.Errorf("trial %d: finalStep=%d; want >= 2 (highestInflightStep tracked step-2 announcement)", trial, finalStep)
-			}
-			// Sanity: pollers must have seen the advance to step 2 at
-			// some point (not merely read it once at exit).
-			if maxObserved.Load() < 2 {
-				t.Errorf("trial %d: maxObserved=%d; pollers never saw step 2 advancing", trial, maxObserved.Load())
-			}
-		}
-	})
+		})
 }
 
 // TestAgentState_TerminalCAS verifies that SetTerminal:

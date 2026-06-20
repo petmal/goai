@@ -1081,6 +1081,50 @@ func TestSendRequest_ClosedChannel(t *testing.T) {
 	}
 }
 
+func TestCallTool_NilArgs(t *testing.T) {
+	mt := newMockTransport()
+	c := NewClient("test", "1.0", WithTransport(mt))
+
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	mt.sendFunc = func(_ context.Context, msg JSONRPCMessage) error {
+		if msg.Method == "tools/call" {
+			// Verify arguments is always present as an object, never omitted
+			var p struct {
+				Name      string         `json:"name"`
+				Arguments map[string]any `json:"arguments"`
+			}
+			if err := json.Unmarshal(msg.Params, &p); err != nil {
+				t.Fatalf("unmarshal params: %v", err)
+			}
+			if p.Name != "noop" {
+				t.Errorf("tool name = %q, want %q", p.Name, "noop")
+			}
+			if p.Arguments == nil {
+				t.Error("arguments should not be nil when args is nil")
+			}
+
+			result, _ := json.Marshal(CallToolResult{
+				Content: []ContentBlock{
+					json.RawMessage(`{"type":"text","text":"ok"}`),
+				},
+			})
+			mt.inject(JSONRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: result})
+		}
+		return nil
+	}
+
+	result, err := c.CallTool(context.Background(), "noop", nil)
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if len(result.Content) != 1 {
+		t.Fatalf("len(content) = %d, want 1", len(result.Content))
+	}
+}
+
 func TestCallTool_NoCapability(t *testing.T) {
 	mt := newMockTransport()
 	mt.serverCaps = ServerCapabilities{}
