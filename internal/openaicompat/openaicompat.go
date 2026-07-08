@@ -303,6 +303,7 @@ type streamResponse struct {
 			Role             string          `json:"role,omitempty"`
 			Content          json.RawMessage `json:"content,omitempty"`
 			ReasoningContent string          `json:"reasoning_content,omitempty"`
+			Reasoning        string          `json:"reasoning,omitempty"`
 			ToolCalls        []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id,omitempty"`
@@ -442,9 +443,14 @@ func ParseStream(ctx context.Context, scanner *sse.Scanner, out chan<- provider.
 			}
 		}
 
-		// Reasoning content
+		// Reasoning content -- prefer reasoning_content (DeepSeek native),
+		// fall back to reasoning (OpenRouter).
 		if delta.ReasoningContent != "" {
 			if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkReasoning, Text: delta.ReasoningContent}) {
+				return
+			}
+		} else if delta.Reasoning != "" {
+			if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkReasoning, Text: delta.Reasoning}) {
 				return
 			}
 		}
@@ -632,6 +638,7 @@ type chatResponse struct {
 			Role             string          `json:"role"`
 			Content          json.RawMessage `json:"content"`
 			ReasoningContent string          `json:"reasoning_content,omitempty"`
+			Reasoning        string          `json:"reasoning,omitempty"`
 			ToolCalls        []struct {
 				ID       string `json:"id"`
 				Type     string `json:"type"`
@@ -684,6 +691,9 @@ func ParseResponse(body []byte) (*provider.GenerateResult, error) {
 		choice := resp.Choices[0]
 		result.Text = extractTextContent(choice.Message.Content)
 		result.Reasoning = choice.Message.ReasoningContent
+		if result.Reasoning == "" {
+			result.Reasoning = choice.Message.Reasoning
+		}
 		result.FinishReason = mapFinishReason(choice.FinishReason)
 
 		for _, tc := range choice.Message.ToolCalls {

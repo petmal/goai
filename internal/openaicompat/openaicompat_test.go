@@ -559,6 +559,31 @@ data: [DONE]
 	}
 }
 
+func TestParseStream_ReasoningFallback(t *testing.T) {
+	// OpenRouter emits reasoning under delta.reasoning (not reasoning_content).
+	input := `data: {"choices":[{"delta":{"reasoning":"Let me think..."},"index":0}]}
+data: {"choices":[{"delta":{"content":"The answer is 42."},"index":0}]}
+data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}]}
+data: [DONE]
+`
+	scanner := sse.NewScanner(strings.NewReader(input))
+	out := make(chan provider.StreamChunk, 10)
+
+	go ParseStream(t.Context(), scanner, out)
+
+	var chunks []provider.StreamChunk
+	for chunk := range out {
+		chunks = append(chunks, chunk)
+	}
+
+	if chunks[0].Type != provider.ChunkReasoning || chunks[0].Text != "Let me think..." {
+		t.Errorf("reasoning chunk = %+v, want ChunkReasoning with 'Let me think...'", chunks[0])
+	}
+	if chunks[1].Type != provider.ChunkText || chunks[1].Text != "The answer is 42." {
+		t.Errorf("text chunk = %+v", chunks[1])
+	}
+}
+
 func TestParseStream_CachedTokens(t *testing.T) {
 	input := `data: {"choices":[{"delta":{"content":"hi"},"index":0}]}
 data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"usage":{"prompt_tokens":100,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":60}}}
@@ -2520,6 +2545,31 @@ func TestParseResponse_NullContent(t *testing.T) {
 	}
 	if result.FinishReason != provider.FinishStop {
 		t.Errorf("FinishReason = %q, want stop", result.FinishReason)
+	}
+}
+
+func TestParseResponse_ReasoningFallback(t *testing.T) {
+	// OpenRouter emits reasoning under message.reasoning (not reasoning_content).
+	body := []byte(`{
+		"id": "chatcmpl-or",
+		"model": "openrouter/test",
+		"choices": [{
+			"index": 0,
+			"message": {"role": "assistant", "content": "Final answer", "reasoning": "Let me think..."},
+			"finish_reason": "stop"
+		}],
+		"usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+	}`)
+
+	result, err := ParseResponse(body)
+	if err != nil {
+		t.Fatalf("ParseResponse error: %v", err)
+	}
+	if result.Reasoning != "Let me think..." {
+		t.Errorf("Reasoning = %q, want %q", result.Reasoning, "Let me think...")
+	}
+	if result.Text != "Final answer" {
+		t.Errorf("Text = %q, want %q", result.Text, "Final answer")
 	}
 }
 

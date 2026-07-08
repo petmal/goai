@@ -969,36 +969,55 @@ func streamWithToolLoop(ctx context.Context, model provider.LanguageModel, o opt
 			// tools" exit therefore cannot be reached here; StopCauseNoExecutableTools
 			// is a sync-only cause (GenerateText). See StopCauseNoExecutableTools
 			// godoc in provider/types.go.
-			if ds.finishReason != provider.FinishToolCalls || len(ds.toolCalls) == 0 {
+			//
+			// Provider/server-executed tools (e.g. OpenRouter web_search) return
+			// finish_reason="tool_calls" with tool_calls=null -- the tool already
+			// ran server-side and there is nothing for the client to execute.
+			// In that case ds.toolCalls is empty but we must NOT exit: the model
+			// is mid-loop and expects us to re-request with the accumulated
+			// messages (including reasoning) so it can produce the final answer.
+			// Issue #112: continue the loop when finish_reason is tool_calls
+			// even when there are no client tool calls, as long as the request
+			// included provider-defined tools (server tools like OpenRouter web_search).
+			if ds.finishReason != provider.FinishToolCalls || (len(ds.toolCalls) == 0 && !hasProviderDefinedTools(params.Tools)) || (len(ds.toolCalls) > 0 && len(toolMap) == 0) {
 				stopCause = provider.StopCauseNatural
 				break
 			}
 
 			// --- Execute tools in parallel ---
-			o.StateRef.set(StepToolExecuting, step)
-			toolMsgs, toolResults := executeToolsParallel(ctx, ds.toolCalls, toolMap, step, toolHooks{
-				sequential:      o.SequentialTools,
-				onToolCallStart: o.OnToolCallStart,
-				onToolCall:      o.OnToolCall,
-				onBeforeExecute: o.OnBeforeToolExecute,
-				onAfterExecute:  o.OnAfterToolExecute,
-				onPanic:         o.OnPanic,
-			})
-			// Attach ToolResults to the step BEFORE the stop predicate sees it
-			// (FIX 7 / Vercel DefaultStepResult parity). steps[-1] is this step.
-			steps[len(steps)-1].ToolResults = toolResults
+			// Provider/server-executed tools (e.g. OpenRouter web_search) return
+			// finish_reason="tool_calls" with tool_calls=null -- the tool already
+			// ran server-side and there is nothing for the client to execute.
+			// Skip tool execution and just append the assistant message so the
+			// loop re-requests with the accumulated context (Issue #112).
+			var toolMsgs []provider.Message
+			var toolResults []provider.ToolResult
+			if len(ds.toolCalls) > 0 {
+				o.StateRef.set(StepToolExecuting, step)
+				toolMsgs, toolResults = executeToolsParallel(ctx, ds.toolCalls, toolMap, step, toolHooks{
+					sequential:      o.SequentialTools,
+					onToolCallStart: o.OnToolCallStart,
+					onToolCall:      o.OnToolCall,
+					onBeforeExecute: o.OnBeforeToolExecute,
+					onAfterExecute:  o.OnAfterToolExecute,
+					onPanic:         o.OnPanic,
+				})
+				// Attach ToolResults to the step BEFORE the stop predicate sees it
+				// (FIX 7 / Vercel DefaultStepResult parity). steps[-1] is this step.
+				steps[len(steps)-1].ToolResults = toolResults
 
-			// Notify the consumer (TextStream.consume) that this step now has
-			// tool results so ts.steps[len-1].ToolResults can be backfilled.
-			// We reuse ChunkStepFinish with a distinguishing stepSource tag so
-			// existing provider-internal ChunkStepFinish handling is untouched.
-			provider.TrySend(ctx, out, provider.StreamChunk{
-				Type: provider.ChunkStepFinish,
-				Metadata: map[string]any{
-					"stepSource":  "goai-tool-results",
-					"toolResults": toolResults,
-				},
-			})
+				// Notify the consumer (TextStream.consume) that this step now has
+				// tool results so ts.steps[len-1].ToolResults can be backfilled.
+				// We reuse ChunkStepFinish with a distinguishing stepSource tag so
+				// existing provider-internal ChunkStepFinish handling is untouched.
+				provider.TrySend(ctx, out, provider.StreamChunk{
+					Type: provider.ChunkStepFinish,
+					Metadata: map[string]any{
+						"stepSource":  "goai-tool-results",
+						"toolResults": toolResults,
+					},
+				})
+			}
 
 			// --- Append messages for next step ---
 			params.Messages = appendToolRoundTrip(params.Messages, ds.text, ds.reasoning, ds.toolCalls, toolMsgs)
@@ -1089,7 +1108,7 @@ func StreamText(ctx context.Context, model provider.LanguageModel, opts ...Optio
 		return nil, err
 	}
 
-	if o.MaxSteps > 1 && len(toolMap) > 0 {
+	if o.MaxSteps > 1 && (len(toolMap) > 0 || hasProviderDefinedTools(o.Tools)) {
 		return streamWithToolLoop(ctx, model, o, toolMap)
 	}
 
@@ -1331,7 +1350,7 @@ func GenerateText(ctx context.Context, model provider.LanguageModel, opts ...Opt
 			result.FinishReason = provider.FinishToolCalls
 		}
 
-		if result.FinishReason != provider.FinishToolCalls || len(result.ToolCalls) == 0 || len(toolMap) == 0 {
+		if result.FinishReason != provider.FinishToolCalls || (len(result.ToolCalls) == 0 && !hasProviderDefinedTools(params.Tools)) || (len(result.ToolCalls) > 0 && len(toolMap) == 0) {
 			tr := buildTextResult(steps, totalUsage)
 			tr.ResponseMessages = buildResponseMessages(params.Messages[originalLen:], steps, nil)
 			// Distinguish "model stopped on its own" from "model wants more
@@ -1354,21 +1373,36 @@ func GenerateText(ctx context.Context, model provider.LanguageModel, opts ...Opt
 		// Clear tool_choice after the first tool step so the model can freely
 		// produce a text response on subsequent steps.
 		params.ToolChoice = ""
-		o.StateRef.set(StepToolExecuting, step)
-		toolMessages, toolResults := executeToolsParallel(ctx, result.ToolCalls, toolMap, step, toolHooks{
-			sequential:      o.SequentialTools,
-			onToolCallStart: o.OnToolCallStart,
-			onToolCall:      o.OnToolCall,
-			onBeforeExecute: o.OnBeforeToolExecute,
-			onAfterExecute:  o.OnAfterToolExecute,
-			onPanic:         o.OnPanic,
-		})
-		// Attach ToolResults to the step BEFORE the stop predicate sees it
-		// (FIX 7 / Vercel DefaultStepResult parity). steps[-1] is this step.
-		steps[len(steps)-1].ToolResults = toolResults
+		// Provider/server-executed tools (e.g. OpenRouter web_search) return
+		// finish_reason="tool_calls" with tool_calls=null -- the tool already
+		// ran server-side and there is nothing for the client to execute.
+		// Skip tool execution and just append the assistant message so the
+		// loop re-requests with the accumulated context (Issue #112).
+		var toolMessages []provider.Message
+		var toolResults []provider.ToolResult
+		if len(result.ToolCalls) > 0 {
+			o.StateRef.set(StepToolExecuting, step)
+			toolMessages, toolResults = executeToolsParallel(ctx, result.ToolCalls, toolMap, step, toolHooks{
+				sequential:      o.SequentialTools,
+				onToolCallStart: o.OnToolCallStart,
+				onToolCall:      o.OnToolCall,
+				onBeforeExecute: o.OnBeforeToolExecute,
+				onAfterExecute:  o.OnAfterToolExecute,
+				onPanic:         o.OnPanic,
+			})
+			// Attach ToolResults to the step BEFORE the stop predicate sees it
+			// (FIX 7 / Vercel DefaultStepResult parity). steps[-1] is this step.
+			steps[len(steps)-1].ToolResults = toolResults
+		}
 
 		// Append assistant message with tool calls + tool result messages.
-		params.Messages = appendToolRoundTrip(params.Messages, result.Text, nil, result.ToolCalls, toolMessages)
+		// For server-executed tools (no client tool calls), pass reasoning
+		// so the model's thinking is preserved in the continuation.
+		var reasoningParts []provider.Part
+		if result.Reasoning != "" {
+			reasoningParts = []provider.Part{{Type: provider.PartReasoning, Text: result.Reasoning}}
+		}
+		params.Messages = appendToolRoundTrip(params.Messages, result.Text, reasoningParts, result.ToolCalls, toolMessages)
 
 		// WithStopWhen (Vercel parity): evaluated AFTER this step's LLM call
 		// AND its tool executions complete. The tool-result messages are
@@ -1490,6 +1524,28 @@ func isProviderExecuted(tc provider.ToolCall) bool {
 	}
 	if _, ok := tc.Metadata["rawItem"]; ok {
 		return true
+	}
+	return false
+}
+
+// hasProviderDefinedTools reports whether any tool in the list is a
+// provider-defined tool (e.g. openrouter:web_search). These tools are
+// executed server-side and return finish_reason="tool_calls" with no
+// client tool calls, but the loop must continue (Issue #112).
+func hasProviderDefinedTools(tools any) bool {
+	switch v := tools.(type) {
+	case []provider.ToolDefinition:
+		for _, t := range v {
+			if t.ProviderDefinedType != "" {
+				return true
+			}
+		}
+	case []Tool:
+		for _, t := range v {
+			if t.ProviderDefinedType != "" {
+				return true
+			}
+		}
 	}
 	return false
 }

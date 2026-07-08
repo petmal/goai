@@ -1086,6 +1086,63 @@ func TestGenerateText_ToolLoop_NoExecuteNoLoop(t *testing.T) {
 	}
 }
 
+func TestGenerateText_ToolLoop_ServerTool(t *testing.T) {
+	// OpenRouter server tools (e.g. openrouter:web_search) return
+	// finish_reason="tool_calls" with tool_calls=null. The loop must
+	// continue by re-requesting with the accumulated messages (Issue #112).
+	callCount := 0
+	model := &mockModel{
+		id: "test",
+		generateFn: func(_ context.Context, params provider.GenerateParams) (*provider.GenerateResult, error) {
+			callCount++
+			if callCount == 1 {
+				// Server tool response: finish_reason=tool_calls, no client tool calls,
+				// but reasoning is present (Issue #111).
+				return &provider.GenerateResult{
+					Reasoning:    "I need to search the web...",
+					FinishReason: provider.FinishToolCalls,
+					Usage:        provider.Usage{InputTokens: 10, OutputTokens: 5},
+				}, nil
+			}
+			// Second call: model has the server tool result and responds with text.
+			return &provider.GenerateResult{
+				Text:         "The weather in Singapore is 32°C.",
+				FinishReason: provider.FinishStop,
+				Usage:        provider.Usage{InputTokens: 20, OutputTokens: 10},
+			}, nil
+		},
+	}
+
+	result, err := GenerateText(t.Context(), model,
+		WithPrompt("weather in Singapore?"),
+		WithMaxSteps(3),
+		WithTools(Tool{
+			Name:               "web_search",
+			Description:        "Search the web",
+			ProviderDefinedType: "openrouter:web_search",
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if callCount != 2 {
+		t.Errorf("model called %d times, want 2 (server tool should continue loop)", callCount)
+	}
+	if result.Text != "The weather in Singapore is 32°C." {
+		t.Errorf("Text = %q", result.Text)
+	}
+	if len(result.Steps) != 2 {
+		t.Fatalf("expected 2 steps, got %d", len(result.Steps))
+	}
+	if result.Steps[0].Reasoning != "I need to search the web..." {
+		t.Errorf("Steps[0].Reasoning = %q, want reasoning preserved", result.Steps[0].Reasoning)
+	}
+	if result.FinishReason != provider.FinishStop {
+		t.Errorf("FinishReason = %q, want stop", result.FinishReason)
+	}
+}
+
 func TestGenerateText_ToolLoop_MultipleToolCalls(t *testing.T) {
 	// Model requests 2 tool calls in one step.
 	callCount := 0
@@ -2421,6 +2478,74 @@ func TestStreamText_ToolLoop_TwoStep(t *testing.T) {
 	}
 	if result.Steps[0].Response.ID != "resp-1" {
 		t.Errorf("Steps[0].Response.ID = %q, want resp-1", result.Steps[0].Response.ID)
+	}
+}
+
+func TestStreamText_ToolLoop_ServerTool(t *testing.T) {
+	// OpenRouter server tools return finish_reason="tool_calls" with
+	// tool_calls=null. The streaming loop must continue (Issue #112).
+	var callCount atomic.Int32
+	model := &mockModel{
+		id: "test-stream",
+		streamFn: func(_ context.Context, _ provider.GenerateParams) (*provider.StreamResult, error) {
+			n := callCount.Add(1)
+			if n == 1 {
+				return streamFromChunks(
+					provider.StreamChunk{Type: provider.ChunkReasoning, Text: "I need to search..."},
+					provider.StreamChunk{Type: provider.ChunkFinish, FinishReason: provider.FinishToolCalls, Usage: provider.Usage{InputTokens: 10, OutputTokens: 5}, Response: provider.ResponseMetadata{ID: "resp-1", Model: "test-model"}},
+				), nil
+			}
+			return streamFromChunks(
+				provider.StreamChunk{Type: provider.ChunkText, Text: "Singapore is 32°C"},
+				provider.StreamChunk{Type: provider.ChunkFinish, FinishReason: provider.FinishStop, Usage: provider.Usage{InputTokens: 20, OutputTokens: 8}, Response: provider.ResponseMetadata{ID: "resp-2", Model: "test-model"}},
+			), nil
+		},
+	}
+
+	stream, err := StreamText(t.Context(), model,
+		WithPrompt("weather?"),
+		WithMaxSteps(3),
+		WithTools(Tool{
+			Name:               "web_search",
+			Description:        "Search the web",
+			ProviderDefinedType: "openrouter:web_search",
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var chunkTypes []provider.StreamChunkType
+	for chunk := range stream.Stream() {
+		chunkTypes = append(chunkTypes, chunk.Type)
+	}
+
+	// Expected: ChunkReasoning, ChunkStepFinish(goai), ChunkText, ChunkStepFinish(goai), ChunkFinish
+	want := []provider.StreamChunkType{
+		provider.ChunkReasoning, provider.ChunkStepFinish,
+		provider.ChunkText, provider.ChunkStepFinish, provider.ChunkFinish,
+	}
+	if len(chunkTypes) != len(want) {
+		t.Fatalf("chunk types = %v, want %v", chunkTypes, want)
+	}
+	for i := range want {
+		if chunkTypes[i] != want[i] {
+			t.Errorf("chunkTypes[%d] = %q, want %q", i, chunkTypes[i], want[i])
+		}
+	}
+
+	result := stream.Result()
+	if len(result.Steps) != 2 {
+		t.Fatalf("Steps = %d, want 2", len(result.Steps))
+	}
+	if result.Steps[0].Reasoning != "I need to search..." {
+		t.Errorf("Steps[0].Reasoning = %q, want reasoning preserved", result.Steps[0].Reasoning)
+	}
+	if result.Steps[1].Text != "Singapore is 32°C" {
+		t.Errorf("Steps[1].Text = %q", result.Steps[1].Text)
+	}
+	if result.TotalUsage.InputTokens != 30 || result.TotalUsage.OutputTokens != 13 {
+		t.Errorf("TotalUsage = %+v, want InputTokens=30, OutputTokens=13", result.TotalUsage)
 	}
 }
 
