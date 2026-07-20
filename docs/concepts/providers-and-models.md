@@ -92,6 +92,7 @@ The `ModelCapabilities` struct includes:
 | `Reasoning`        | `bool`        | Extended thinking / chain-of-thought      |
 | `Attachment`       | `bool`        | File attachment support                   |
 | `ToolCall`         | `bool`        | Tool / function calling                   |
+| `FileUpload`       | `bool`        | Remote file upload support                |
 | `InputModalities`  | `ModalitySet` | Supported input types (text, image, etc.) |
 | `OutputModalities` | `ModalitySet` | Supported output types                    |
 

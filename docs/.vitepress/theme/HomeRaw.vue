@@ -136,17 +136,34 @@ onMounted(() => {
         <p class="rh-section-label">What's new</p>
         <div class="rh-release-list">
           <a
-            href="https://github.com/zendev-sh/goai/releases/tag/v0.7.2"
+            href="https://github.com/zendev-sh/goai/releases/tag/v0.9.0"
             class="rh-release"
           >
-            <span class="rh-release-tag">v0.7.2</span>
+            <span class="rh-release-tag">v0.9.0</span>
             <span class="rh-release-text"
-              ><strong>NVIDIA NIM provider</strong> — New provider.
-              OpenAI-compatible chat + embeddings. E2E tested with meta/llama-3.3-70b-instruct.</span
+              ><strong>File upload &amp; remote file refs</strong> — Provider-neutral file upload for OpenAI, Anthropic, and Google Gemini. Compat providers fall back to inline base64.</span
             >
           </a>
           <a
-            href="https://github.com/zendev-sh/goai/releases/tag/v0.7.0"
+            href="https://github.com/zendev-sh/goai/releases/tag/v0.8.5"
+            class="rh-release"
+          >
+            <span class="rh-release-tag">v0.8.5</span>
+            <span class="rh-release-text"
+              ><strong>Requesty provider</strong> — New OpenAI-compatible LLM gateway provider. Anthropic native structured output, per-step Reasoning.</span
+            >
+          </a>
+          <a
+            href="https://github.com/zendev-sh/goai/releases/tag/v0.8.0"
+            class="rh-release"
+          >
+            <span class="rh-release-tag">v0.8.0</span>
+            <span class="rh-release-text"
+              ><strong>MCP OAuth 2.1 + PKCE</strong> — Native OAuth for remote MCP servers. NewTool typed constructor. Hook panics surfaced as PanicError.</span
+            >
+          </a>
+          <a
+            href="https://github.com/zendev-sh/goai/releases"
             class="rh-release"
           >
             <span class="rh-release-tag">v0.7.0</span>
@@ -155,26 +172,6 @@ onMounted(() => {
               <strong>FPT Smart Cloud</strong> — New providers.
               OpenAI-compatible chat + embeddings. FPT supports Global and
               Japan regions.</span
-            >
-          </a>
-          <a
-            href="https://github.com/zendev-sh/goai/releases"
-            class="rh-release"
-          >
-            <span class="rh-release-tag">v0.6.0</span>
-            <span class="rh-release-text"
-              ><strong>OpenTelemetry integration</strong> — Tracing, metrics,
-              GenAI semantic conventions.</span
-            >
-          </a>
-          <a
-            href="https://github.com/zendev-sh/goai/releases"
-            class="rh-release"
-          >
-            <span class="rh-release-tag">v0.5.8</span>
-            <span class="rh-release-text"
-              ><strong>RunPod provider</strong> — Serverless vLLM support.
-              Bedrock embeddings. Docs accuracy improvements.</span
             >
           </a>
         </div>

@@ -1,6 +1,6 @@
 # GoAI Roadmap
 
-> Last updated: 2026-06-21
+> Last updated: 2026-07-20
 
 ## v0.4.4
 
@@ -142,7 +142,13 @@
 | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **MCP HTTPTransport: POST-only Streamable HTTP** | `mcp.HTTPTransport.Start` now treats `405` (or `404`) on the optional GET-for-SSE channel as "no server-initiated stream" per the MCP Streamable HTTP spec (2025-03-26), so POST-only servers (Zoho MCP and others) work instead of failing with `mcp: SSE connection failed: HTTP 405`. Inline JSON-RPC and `text/event-stream` POST responses are still dispatched as before. (#76) |
 
-## v0.8.5 - Current release
+## v0.9.0 - Current release
+
+| Feature                                  | Description                                                                                                                                                                                                                     |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **File upload & remote file references** | New `FileUploader` interface with `UploadFile`/`DeleteFile` for OpenAI (Files API), Anthropic (Files API), and Google Gemini (Files API). New `RemoteFileRef` type with `Part.RemoteRef` field. Compat providers fall back to inline base64 via `RemoteFileRef.Data`. `ModelCapabilities.FileUpload` capability flag. |
+
+## v0.8.5
 
 | Feature                             | Description                                                                                                                                                                                                                                                                            |
 | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

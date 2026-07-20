@@ -561,6 +561,7 @@ type Part struct {
     Detail          string          // Image detail level ("low", "high", "auto").
     MediaType       string          // Content type (for PartImage, PartFile).
     Filename        string          // For PartFile.
+    RemoteRef       *RemoteFileRef  // Reference to an uploaded remote file (for PartFile, PartImage).
     ProviderOptions map[string]any  // Provider-specific part parameters.
 }
 ```
@@ -691,6 +692,7 @@ type ModelCapabilities struct {
     Reasoning        bool        // Supports extended thinking/reasoning.
     Attachment       bool        // Supports file attachments.
     ToolCall         bool        // Supports tool/function calling.
+    FileUpload       bool        // Supports remote file upload.
     InputModalities  ModalitySet // Supported input types.
     OutputModalities ModalitySet // Supported output types.
 }
@@ -869,4 +871,62 @@ Utility for provider implementors. Sends a chunk to a stream channel, returning 
 
 ```go
 func TrySend(ctx context.Context, out chan<- StreamChunk, chunk StreamChunk) bool
+```
+
+### FileUpload
+
+Describes a file to upload to a provider's remote storage.
+
+```go
+type FileUpload struct {
+    Reader    io.Reader // File content to upload.
+    Filename  string    // Name of the file.
+    MediaType string    // MIME type (e.g. "application/pdf").
+    Purpose   string    // Intended use (e.g. "assistants", "vision").
+}
+```
+
+### RemoteFileRef
+
+A reference to an uploaded remote file. Carries raw bytes for fallback on providers without native file APIs.
+
+```go
+type RemoteFileRef struct {
+    Provider  string    // Provider that owns this file.
+    ID        string    // Provider-specific file identifier.
+    URI       string    // Provider-specific file URI (e.g. for Gemini).
+    Filename  string    // Original file name.
+    MediaType string    // MIME type.
+    ExpiresAt time.Time // When the remote file expires (zero if unknown).
+    Data      []byte    // Raw file bytes for compat fallback.
+}
+```
+
+### FileUploader
+
+Interface for uploading and deleting remote files. Providers that support file upload implement `FileUploadCapableModel`.
+
+```go
+type FileUploader interface {
+    UploadFile(ctx context.Context, upload *FileUpload) (*RemoteFileRef, error)
+    DeleteFile(ctx context.Context, ref *RemoteFileRef) error
+}
+```
+
+### FileUploadCapableModel
+
+Optional interface that `LanguageModel` implementations can satisfy to indicate they support remote file upload. Use `FileUploader()` to get the uploader.
+
+```go
+type FileUploadCapableModel interface {
+    FileUploader() FileUploader
+}
+```
+
+### ErrFileUploadUnsupported
+
+Sentinel error returned by providers that do not support remote file upload. Callers can check for this error to fall back to inline data URIs.
+
+```go
+var ErrFileUploadUnsupported = errors.New("provider: file upload not supported by this provider")
 ```

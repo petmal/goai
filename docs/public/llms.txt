@@ -1,8 +1,8 @@
 # GoAI SDK
 
-> Go SDK for building AI applications. One unified API across 22+ LLM providers.
+> Go SDK for building AI applications. One unified API across 25+ LLM providers.
 
-GoAI SDK is an open-source Go library inspired by the Vercel AI SDK, designed idiomatically for Go with generics, interfaces, and channels. It provides a single API surface for text generation, streaming, structured output, embeddings, image generation, and tool calling across 22+ providers including OpenAI, Anthropic, Google Gemini, AWS Bedrock, Azure, and more.
+GoAI SDK is an open-source Go library inspired by the Vercel AI SDK, designed idiomatically for Go with generics, interfaces, and channels. It provides a single API surface for text generation, streaming, structured output, embeddings, image generation, and tool calling across 25+ providers including OpenAI, Anthropic, Google Gemini, AWS Bedrock, Azure, and more.
 
 - Website: https://goai.sh
 - GitHub: https://github.com/zendev-sh/goai

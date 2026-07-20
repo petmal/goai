@@ -9,13 +9,13 @@ description: "Open-source Go SDK for AI applications. One unified API for OpenAI
 
 ## What's New
 
-> **v0.7.2** — New provider: [NVIDIA NIM](/providers/nvidia) (OpenAI-compatible, chat + embeddings). E2E tested with `meta/llama-3.3-70b-instruct`. [Changelog →](https://github.com/zendev-sh/goai/releases)
+> **v0.9.0** — Provider-neutral file upload and remote file references. `FileUploader` interface + `RemoteFileRef` for OpenAI, Anthropic, and Google Gemini. Compat providers fall back to inline base64. [Changelog →](https://github.com/zendev-sh/goai/releases)
 >
-> **v0.7.0** — New providers: [Cloudflare Workers AI](/providers/cloudflare) and [FPT Smart Cloud](/providers/fptcloud) (both OpenAI-compatible, chat + embeddings). [Changelog →](https://github.com/zendev-sh/goai/releases)
+> **v0.8.5** — New provider: [Requesty](/providers/requesty) (OpenAI-compatible LLM gateway). Anthropic native structured output, per-step `Reasoning`, Gemini schema sanitization. [Changelog →](https://github.com/zendev-sh/goai/releases)
 >
-> **v0.6.0** — OpenTelemetry tracing + metrics, context propagation via RequestInfo.Ctx, Langfuse data race fix. [Changelog →](https://github.com/zendev-sh/goai/releases)
+> **v0.8.0** — MCP OAuth 2.1 + PKCE, `NewTool[In]` typed constructor, lifecycle hook panics surfaced as `*PanicError`. [Changelog →](https://github.com/zendev-sh/goai/releases)
 >
-> **v0.5.8** — RunPod provider (serverless vLLM), Bedrock embeddings, and docs accuracy improvements. [Changelog →](https://github.com/zendev-sh/goai/releases)
+> **v0.7.0** — New providers: [Cloudflare Workers AI](/providers/cloudflare) and [FPT Smart Cloud](/providers/fptcloud). [Changelog →](https://github.com/zendev-sh/goai/releases)
 
 ## What is GoAI SDK?
 
