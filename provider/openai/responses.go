@@ -445,7 +445,9 @@ type responsesToolCall struct {
 // Copilot rotates item_id mid-stream, so we track by output_index
 // and use the canonical ID from output_item.added.
 type responsesReasoning struct {
-	canonicalID string
+	canonicalID     string
+	lastSummaryIdx  int
+	hasSentSummary  bool
 }
 
 // streamResponses parses SSE from the OpenAI Responses API.
@@ -516,11 +518,22 @@ func streamResponses(ctx context.Context, body io.ReadCloser, out chan<- provide
 				Delta        string `json:"delta"`
 			}
 			if json.Unmarshal([]byte(data), &ev) == nil && ev.Delta != "" {
-				// Use canonical ID from activeReasoning if available.
 				id := ev.ItemID
 				if currentReasoningIdx >= 0 {
 					if ar := activeReasoning[currentReasoningIdx]; ar != nil {
 						id = ar.canonicalID
+						// Insert a separator when summary_index changes so
+						// distinct summaries don't merge into one text block.
+						if ar.hasSentSummary && ev.SummaryIndex != ar.lastSummaryIdx {
+							if !provider.TrySend(ctx, out, provider.StreamChunk{
+								Type: provider.ChunkReasoning,
+								Text: "\n\n",
+							}) {
+								return
+							}
+						}
+						ar.lastSummaryIdx = ev.SummaryIndex
+						ar.hasSentSummary = true
 					}
 				}
 				if !provider.TrySend(ctx, out, provider.StreamChunk{
@@ -535,8 +548,7 @@ func streamResponses(ctx context.Context, body io.ReadCloser, out chan<- provide
 			}
 
 		case "response.reasoning_summary_part.added":
-			// New summary segment within same reasoning item -- no-op for chunk emission
-			// but tracked for canonical ID resolution.
+			// New summary segment within same reasoning item.
 
 		case "response.output_item.added":
 			var ev struct {
@@ -996,7 +1008,7 @@ func parseResponsesResult(body []byte) (*provider.GenerateResult, error) {
 	}
 
 	result.Text = strings.Join(textParts, "")
-	result.Reasoning = strings.Join(reasoningParts, "")
+	result.Reasoning = strings.Join(reasoningParts, "\n\n")
 
 	if len(allLogprobs) > 0 {
 		providerMeta["logprobs"] = allLogprobs

@@ -2174,8 +2174,8 @@ func TestParseResponsesResult_ReasoningSummary(t *testing.T) {
 	if result.Text != "answer" {
 		t.Errorf("Text = %q, want %q", result.Text, "answer")
 	}
-	if result.Reasoning != "Step one. Step two." {
-		t.Errorf("Reasoning = %q, want %q", result.Reasoning, "Step one. Step two.")
+	if result.Reasoning != "Step one. \n\nStep two." {
+		t.Errorf("Reasoning = %q, want %q", result.Reasoning, "Step one. \n\nStep two.")
 	}
 }
 
@@ -2891,8 +2891,8 @@ func TestStreamResponses_ReasoningWithCanonicalID(t *testing.T) {
 		}
 	}
 
-	if len(reasoningChunks) != 2 {
-		t.Fatalf("expected 2 reasoning chunks, got %d", len(reasoningChunks))
+	if len(reasoningChunks) != 3 {
+		t.Fatalf("expected 3 reasoning chunks (text + separator + text), got %d", len(reasoningChunks))
 	}
 
 	// First reasoning chunk should use canonical ID (rs_canonical_001), not the rotated one.
@@ -2908,11 +2908,16 @@ func TestStreamResponses_ReasoningWithCanonicalID(t *testing.T) {
 		t.Errorf("reasoning text[0] = %q", reasoningChunks[0].Text)
 	}
 
-	// Second reasoning chunk should also use canonical ID but summary_index=1.
-	meta1 := reasoningChunks[1].Metadata
-	rid1, _ := meta1["reasoningId"].(string)
-	if rid1 != "rs_canonical_001:1" {
-		t.Errorf("reasoningId[1] = %q, want %q", rid1, "rs_canonical_001:1")
+	// Second chunk is the separator between summary_index 0 and 1.
+	if reasoningChunks[1].Text != "\n\n" {
+		t.Errorf("reasoning chunk[1] = %q, want separator \\n\\n", reasoningChunks[1].Text)
+	}
+
+	// Third reasoning chunk should use canonical ID but summary_index=1.
+	meta2 := reasoningChunks[2].Metadata
+	rid2, _ := meta2["reasoningId"].(string)
+	if rid2 != "rs_canonical_001:1" {
+		t.Errorf("reasoningId[2] = %q, want %q", rid2, "rs_canonical_001:1")
 	}
 
 	if !gotText {
