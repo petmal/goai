@@ -18,6 +18,8 @@ import (
 	"maps"
 	"net/http"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -200,11 +202,54 @@ type chatModel struct {
 
 func (m *chatModel) ModelID() string { return m.id }
 
-// supportsThinking returns true for Anthropic models that support extended thinking.
+// anthropicModelVersionPattern matches the generation numbers in a
+// current-naming Anthropic model id ("claude-<family>-<major>[-<minor>]").
+//
+// Deliberately unanchored: Bedrock reuses this provider via
+// bedrock.AnthropicChat with a prefixed id ("anthropic.claude-opus-5",
+// "us.anthropic.claude-sonnet-4-6"), and Vertex appends an "@date" suffix
+// ("claude-opus-4-5@20251101"). Legacy family-last ids ("claude-3-7-sonnet",
+// "claude-3-5-sonnet-20241022") do not match and are reported as unversioned.
+var anthropicModelVersionPattern = regexp.MustCompile(`claude-(?:opus|sonnet|haiku|fable|mythos)-(\d+)(?:-(\d+))?`)
+
+// anthropicModelVersion extracts the major and minor generation numbers from a
+// current-naming Anthropic model id. ok is false when the id carries no
+// parseable version, in which case callers should fall back to legacy handling.
+//
+// A trailing numeric segment is only treated as a minor version when it is one
+// or two digits; longer runs are release dates, not versions, so
+// "claude-sonnet-4-20250514" reports major 4 with no minor rather than minor
+// 20250514.
+func anthropicModelVersion(modelID string) (major, minor int, ok bool) {
+	m := anthropicModelVersionPattern.FindStringSubmatch(strings.ToLower(modelID))
+	if m == nil {
+		return 0, 0, false
+	}
+	major, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, 0, false
+	}
+	if len(m[2]) > 0 && len(m[2]) <= 2 {
+		// Cannot fail: the pattern matched one or two ASCII digits.
+		minor, _ = strconv.Atoi(m[2])
+	}
+	return major, minor, true
+}
+
+// supportsThinking returns true for Anthropic models that support extended
+// thinking: every model from the Claude 4 generation onward, plus the legacy
+// claude-3-7-sonnet.
+//
+// Version-derived rather than a literal model list, which had gone stale for
+// the 5.x generation (claude-opus-5, claude-sonnet-5, claude-fable-5) and for
+// claude-haiku-4-5, all of which support thinking but matched none of the
+// previous substrings.
 func supportsThinking(modelID string) bool {
-	return strings.Contains(modelID, "claude-3-7-sonnet") ||
-		strings.Contains(modelID, "claude-sonnet-4") ||
-		strings.Contains(modelID, "claude-opus-4")
+	if strings.Contains(modelID, "claude-3-7-sonnet") {
+		return true
+	}
+	major, _, ok := anthropicModelVersion(modelID)
+	return ok && major >= 4
 }
 
 // hasRemoteRef returns true if any message part contains a RemoteRef.
@@ -772,15 +817,28 @@ func (m *chatModel) useNativeOutputFormat(params provider.GenerateParams) bool {
 	}
 }
 
-// supportsNativeOutputFormat returns true for models that support native output_format.
-// Matches Vercel: claude-sonnet-4-6, claude-opus-4-6, claude-sonnet-4-5, claude-opus-4-5, claude-opus-4-1.
+// supportsNativeOutputFormat returns true for models that support native
+// structured output (output_config.format): the Claude 4.1 release and
+// everything after it.
+//
+// Version-derived rather than a literal model list. The previous list
+// (claude-sonnet-4-6, claude-opus-4-6, claude-sonnet-4-5, claude-opus-4-5,
+// claude-opus-4-1) had gone stale for every model shipped since: opus-4-7,
+// opus-4-8, haiku-4-5, and the whole 5.x generation (opus-5, sonnet-5,
+// fable-5) all support it but matched none of those substrings, so
+// structuredOutputMode "auto" silently fell back to the tool_choice-forcing
+// tool trick — which the Messages API rejects when thinking is enabled.
 func (m *chatModel) supportsNativeOutputFormat() bool {
-	id := m.id
-	return strings.Contains(id, "claude-sonnet-4-6") ||
-		strings.Contains(id, "claude-opus-4-6") ||
-		strings.Contains(id, "claude-sonnet-4-5") ||
-		strings.Contains(id, "claude-opus-4-5") ||
-		strings.Contains(id, "claude-opus-4-1")
+	major, minor, ok := anthropicModelVersion(m.id)
+	if !ok {
+		return false
+	}
+	if major >= 5 {
+		return true
+	}
+	// Within the 4.x generation, 4.0 (which appears either bare or with a
+	// release-date suffix, so minor is 0) predates structured output.
+	return major == 4 && minor >= 1
 }
 
 // injectNativeOutputFormat stores the structured-output schema in
@@ -802,6 +860,7 @@ func injectNativeOutputFormat(params provider.GenerateParams) provider.GenerateP
 		if err := json.Unmarshal(p.ResponseFormat.Schema, &schema); err != nil {
 			return params // schema invalid, fall back to tool trick
 		}
+		schema = stripNativeOutputKeywords(schema)
 	}
 	p.ProviderOptions["output_format"] = map[string]any{
 		"type":   "json_schema",
@@ -810,6 +869,105 @@ func injectNativeOutputFormat(params provider.GenerateParams) provider.GenerateP
 	// Clear ResponseFormat so the tool trick is not also applied.
 	p.ResponseFormat = nil
 	return p
+}
+
+// nativeOutputUnsupportedKeywords lists the JSON Schema validation keywords
+// that Anthropic's native structured-output validator rejects outright, e.g.
+//
+//	output_config.format.schema: For 'number' type, properties maximum,
+//	minimum are not supported
+//
+// Per Anthropic's structured-output schema limitations these are the numeric
+// constraints, the string-length constraints, and the more complex array
+// constraints. Basic types, enum/const, anyOf/allOf, $ref/$defs, string
+// formats, and additionalProperties:false are all supported and are left
+// alone.
+//
+// Only the native output_config.format path needs this. The tool-trick path
+// sends the same schema as a tool's input_schema, where these keywords are
+// advisory (no strict:true) and therefore harmless — so a caller who stays on
+// the tool trick keeps full validation.
+var nativeOutputUnsupportedKeywords = map[string]bool{
+	"minimum":          true,
+	"maximum":          true,
+	"exclusiveMinimum": true,
+	"exclusiveMaximum": true,
+	"multipleOf":       true,
+	"minLength":        true,
+	"maxLength":        true,
+	"minItems":         true,
+	"maxItems":         true,
+	"uniqueItems":      true,
+}
+
+// schemaNameKeyedKeywords lists the keywords whose value is a map keyed by
+// *names* — data-model property names or definition names — rather than a
+// schema object. The keys inside them are caller-chosen identifiers, so they
+// must never be filtered as validation keywords: a response field legitimately
+// named "minimum" is not the numeric `minimum` constraint.
+var schemaNameKeyedKeywords = map[string]bool{
+	"properties":        true,
+	"patternProperties": true,
+	"dependentSchemas":  true,
+	"$defs":             true,
+	"definitions":       true,
+}
+
+// stripNativeOutputKeywords walks an arbitrary schema value and removes every
+// keyword in nativeOutputUnsupportedKeywords wherever it appears in keyword
+// position, so a schema carrying constraints Anthropic does not support is
+// still usable with native structured output instead of failing the request.
+//
+// Filtering is position-aware. Inside a schemaNameKeyedKeywords map the keys
+// are data-model names, so only their values are sanitised; deleting them
+// would silently drop caller fields from the requested shape and could leave
+// `required` referencing a property that no longer exists. (The sibling
+// sanitiser in internal/gemini instead reconciles `required` against
+// `properties` after the fact; not deleting the properties in the first place
+// makes that unnecessary here.)
+//
+// The function does not mutate its input: new maps/slices are allocated for
+// every container so callers can safely reuse the original schema.
+func stripNativeOutputKeywords(obj any) any {
+	switch v := obj.(type) {
+	case map[string]any:
+		result := make(map[string]any, len(v))
+		for k, val := range v {
+			if nativeOutputUnsupportedKeywords[k] {
+				continue
+			}
+			if schemaNameKeyedKeywords[k] {
+				result[k] = stripNameKeyedMap(val)
+				continue
+			}
+			result[k] = stripNativeOutputKeywords(val)
+		}
+		return result
+	case []any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = stripNativeOutputKeywords(item)
+		}
+		return out
+	default:
+		return obj
+	}
+}
+
+// stripNameKeyedMap sanitises the values of a name-keyed map (the value of
+// "properties", "$defs", and friends) while preserving every key verbatim.
+// A non-map value is handed back to the ordinary walk, so a malformed schema
+// is passed through rather than mangled here.
+func stripNameKeyedMap(obj any) any {
+	m, ok := obj.(map[string]any)
+	if !ok {
+		return stripNativeOutputKeywords(obj)
+	}
+	result := make(map[string]any, len(m))
+	for name, sub := range m {
+		result[name] = stripNativeOutputKeywords(sub)
+	}
+	return result
 }
 
 const responseFormatToolName = "json_response"

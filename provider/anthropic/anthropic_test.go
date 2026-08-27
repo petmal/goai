@@ -3872,3 +3872,305 @@ func TestDoGenerate_CacheTTLOnWire(t *testing.T) {
 		t.Errorf("anthropic-beta = %q, want %q (1h TTL is GA)", betaHeader, betaFeatures)
 	}
 }
+
+func TestAnthropicModelVersion(t *testing.T) {
+	cases := []struct {
+		id    string
+		major int
+		minor int
+		ok    bool
+	}{
+		// Current naming, with and without a release-date suffix.
+		{"claude-opus-4-7", 4, 7, true},
+		{"claude-opus-4-7-20260101", 4, 7, true},
+		{"claude-sonnet-4-6-20260310", 4, 6, true},
+		{"claude-haiku-4-5-20251001", 4, 5, true},
+		{"claude-opus-5", 5, 0, true},
+		{"claude-fable-5", 5, 0, true},
+		{"claude-mythos-5", 5, 0, true},
+		{"claude-opus-5-1", 5, 1, true},
+		// Multi-digit minor versions.
+		{"claude-sonnet-4-10", 4, 10, true},
+		// A trailing 8-digit run is a release date, not a minor version.
+		{"claude-sonnet-4-20250514", 4, 0, true},
+		{"claude-opus-4-20250514", 4, 0, true},
+		// Bedrock reuses this provider with a prefixed id.
+		{"anthropic.claude-opus-5", 5, 0, true},
+		{"us.anthropic.claude-sonnet-4-6", 4, 6, true},
+		// Vertex appends an @date suffix.
+		{"claude-opus-4-5@20251101", 4, 5, true},
+		// Legacy family-last naming carries no parseable version.
+		{"claude-3-7-sonnet", 0, 0, false},
+		{"claude-3-5-sonnet-20241022", 0, 0, false},
+		{"anthropic.claude-3-5-sonnet-20241022-v2:0", 0, 0, false},
+		{"not-a-claude-model", 0, 0, false},
+		{"", 0, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.id, func(t *testing.T) {
+			major, minor, ok := anthropicModelVersion(tc.id)
+			if ok != tc.ok || major != tc.major || minor != tc.minor {
+				t.Errorf("anthropicModelVersion(%q) = (%d, %d, %v), want (%d, %d, %v)",
+					tc.id, major, minor, ok, tc.major, tc.minor, tc.ok)
+			}
+		})
+	}
+}
+
+func TestSupportsThinking(t *testing.T) {
+	cases := []struct {
+		id   string
+		want bool
+	}{
+		// Previously matched by the literal list -- must not regress.
+		{"claude-3-7-sonnet", true},
+		{"claude-3-7-sonnet-20250219", true},
+		{"claude-sonnet-4-20250514", true},
+		{"claude-opus-4-20250514", true},
+		{"claude-sonnet-4-6", true},
+		{"claude-opus-4-6", true},
+		{"claude-opus-4-5", true},
+		// Previously false despite supporting thinking.
+		{"claude-haiku-4-5-20251001", true},
+		{"claude-opus-4-7", true},
+		{"claude-opus-4-8", true},
+		{"claude-opus-5", true},
+		{"claude-sonnet-5", true},
+		{"claude-fable-5", true},
+		{"claude-mythos-5", true},
+		{"anthropic.claude-opus-5", true},
+		// Pre-4 models have no thinking support.
+		{"claude-3-5-sonnet-20241022", false},
+		{"claude-3-haiku-20240307", false},
+		{"not-a-claude-model", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.id, func(t *testing.T) {
+			if got := supportsThinking(tc.id); got != tc.want {
+				t.Errorf("supportsThinking(%q) = %v, want %v", tc.id, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSupportsNativeOutputFormat(t *testing.T) {
+	cases := []struct {
+		id   string
+		want bool
+	}{
+		// Previously matched by the literal list -- must not regress.
+		{"claude-sonnet-4-6", true},
+		{"claude-sonnet-4-6-20260310", true},
+		{"claude-opus-4-6", true},
+		{"claude-sonnet-4-5", true},
+		{"claude-opus-4-5", true},
+		{"claude-opus-4-1", true},
+		// Previously false despite supporting structured output.
+		{"claude-opus-4-7", true},
+		{"claude-opus-4-8", true},
+		{"claude-haiku-4-5-20251001", true},
+		{"claude-opus-5", true},
+		{"claude-sonnet-5", true},
+		{"claude-fable-5", true},
+		{"claude-mythos-5", true},
+		{"anthropic.claude-opus-5", true},
+		{"claude-opus-4-5@20251101", true},
+		// The 4.0 release predates structured output, bare or dated.
+		{"claude-sonnet-4-20250514", false},
+		{"claude-opus-4-20250514", false},
+		// Legacy family-last naming.
+		{"claude-3-5-sonnet-20241022", false},
+		{"claude-3-7-sonnet", false},
+		{"not-a-claude-model", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.id, func(t *testing.T) {
+			m := &chatModel{id: tc.id}
+			if got := m.supportsNativeOutputFormat(); got != tc.want {
+				t.Errorf("supportsNativeOutputFormat(%q) = %v, want %v", tc.id, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStripNativeOutputKeywords(t *testing.T) {
+	in := map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"required":             []any{"confidence"},
+		"properties": map[string]any{
+			"confidence": map[string]any{
+				"type": "number", "minimum": 0.0, "maximum": 1.0,
+			},
+			"scenario": map[string]any{
+				"type": "string", "minLength": 1.0, "format": "uuid",
+			},
+			"severity": map[string]any{
+				"type": "string", "enum": []any{"high", "low"},
+			},
+			"tags": map[string]any{
+				"type": "array", "minItems": 1.0, "uniqueItems": true,
+				"items": map[string]any{"type": "string", "maxLength": 8.0},
+			},
+			"either": map[string]any{
+				"anyOf": []any{
+					map[string]any{"type": "integer", "multipleOf": 2.0},
+					map[string]any{"type": "null"},
+				},
+			},
+		},
+	}
+
+	got, ok := stripNativeOutputKeywords(in).(map[string]any)
+	if !ok {
+		t.Fatalf("stripNativeOutputKeywords returned %T, want map", got)
+	}
+
+	// Every unsupported keyword must be gone, at every depth.
+	var walk func(any)
+	walk = func(node any) {
+		switch n := node.(type) {
+		case map[string]any:
+			for k, v := range n {
+				if nativeOutputUnsupportedKeywords[k] {
+					t.Errorf("unsupported keyword %q survived sanitisation", k)
+				}
+				walk(v)
+			}
+		case []any:
+			for _, v := range n {
+				walk(v)
+			}
+		}
+	}
+	walk(got)
+
+	// Supported constructs must survive untouched.
+	props := got["properties"].(map[string]any)
+	if props["confidence"].(map[string]any)["type"] != "number" {
+		t.Errorf("confidence type lost: %#v", props["confidence"])
+	}
+	if props["scenario"].(map[string]any)["format"] != "uuid" {
+		t.Errorf("string format must survive: %#v", props["scenario"])
+	}
+	if enum := props["severity"].(map[string]any)["enum"].([]any); len(enum) != 2 {
+		t.Errorf("enum must survive: %#v", enum)
+	}
+	if got["additionalProperties"] != false {
+		t.Errorf("additionalProperties:false must survive: %#v", got["additionalProperties"])
+	}
+	if req := got["required"].([]any); len(req) != 1 || req[0] != "confidence" {
+		t.Errorf("required must survive: %#v", req)
+	}
+	if anyOf := props["either"].(map[string]any)["anyOf"].([]any); len(anyOf) != 2 {
+		t.Errorf("anyOf must survive: %#v", anyOf)
+	}
+
+	// Input must not be mutated.
+	origConf := in["properties"].(map[string]any)["confidence"].(map[string]any)
+	if _, stillThere := origConf["minimum"]; !stillThere {
+		t.Error("stripNativeOutputKeywords mutated its input")
+	}
+}
+
+func TestBuildRequest_NativeOutputFormat_SanitisesSchema(t *testing.T) {
+	m := &chatModel{id: "claude-opus-5", opts: options{baseURL: defaultBaseURL}}
+
+	// A constrained schema of exactly the shape the API rejects.
+	schema := json.RawMessage(`{"type":"object","additionalProperties":false,` +
+		`"properties":{"confidence":{"type":"number","minimum":0,"maximum":1}},` +
+		`"required":["confidence"]}`)
+	params := provider.GenerateParams{
+		Messages:        []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		ResponseFormat:  &provider.ResponseFormat{Schema: schema},
+		ProviderOptions: map[string]any{"structuredOutputMode": "outputFormat"},
+	}
+
+	params = injectNativeOutputFormat(params)
+	body := m.buildRequest(params, false)
+
+	raw, err := json.Marshal(body["output_config"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kw := range []string{"minimum", "maximum"} {
+		if strings.Contains(string(raw), `"`+kw+`"`) {
+			t.Errorf("output_config still carries %q: %s", kw, raw)
+		}
+	}
+	// The schema itself must still be there and still be usable.
+	if !strings.Contains(string(raw), `"confidence"`) {
+		t.Errorf("sanitisation dropped the schema body: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"json_schema"`) {
+		t.Errorf("output_config.format.type lost: %s", raw)
+	}
+}
+
+// TestStripNativeOutputKeywords_PropertyNameCollision covers the case the
+// first version of the sanitiser got wrong: a data-model field whose name
+// happens to match a constraint keyword must survive, because keys inside
+// "properties"/"$defs"/etc. are caller-chosen names, not validation keywords.
+// Deleting them silently changed the requested shape and could leave
+// "required" pointing at a property that no longer existed.
+func TestStripNativeOutputKeywords_PropertyNameCollision(t *testing.T) {
+	in := map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"required":             []any{"minimum", "maximum", "uniqueItems"},
+		"properties": map[string]any{
+			// Field names colliding with every stripped keyword.
+			"minimum":     map[string]any{"type": "number", "minimum": 0.0},
+			"maximum":     map[string]any{"type": "number", "maximum": 1.0},
+			"uniqueItems": map[string]any{"type": "boolean"},
+			"minLength":   map[string]any{"type": "integer", "minLength": 3.0},
+		},
+		"$defs": map[string]any{
+			"multipleOf": map[string]any{"type": "string", "maxLength": 4.0},
+		},
+		"patternProperties": map[string]any{
+			"^minItems$": map[string]any{"type": "string", "minLength": 1.0},
+		},
+	}
+
+	got := stripNativeOutputKeywords(in).(map[string]any)
+
+	// Every property name survives.
+	props := got["properties"].(map[string]any)
+	for _, name := range []string{"minimum", "maximum", "uniqueItems", "minLength"} {
+		if _, ok := props[name]; !ok {
+			t.Errorf("property %q was deleted; keys inside properties are names, not keywords", name)
+		}
+	}
+	if _, ok := got["$defs"].(map[string]any)["multipleOf"]; !ok {
+		t.Error(`$defs entry "multipleOf" was deleted`)
+	}
+	if _, ok := got["patternProperties"].(map[string]any)["^minItems$"]; !ok {
+		t.Error(`patternProperties entry "^minItems$" was deleted`)
+	}
+
+	// required stays satisfiable: every name in it still exists in properties.
+	for _, r := range got["required"].([]any) {
+		if _, ok := props[r.(string)]; !ok {
+			t.Errorf("required references %q which is no longer in properties", r)
+		}
+	}
+
+	// Constraints in genuine keyword position are still stripped, including
+	// those nested inside the colliding properties and $defs.
+	if _, ok := props["minimum"].(map[string]any)["minimum"]; ok {
+		t.Error("constraint in keyword position inside a colliding property survived")
+	}
+	if _, ok := props["minLength"].(map[string]any)["minLength"]; ok {
+		t.Error("minLength constraint inside property named minLength survived")
+	}
+	if _, ok := got["$defs"].(map[string]any)["multipleOf"].(map[string]any)["maxLength"]; ok {
+		t.Error("maxLength constraint inside a $defs entry survived")
+	}
+	if _, ok := got["patternProperties"].(map[string]any)["^minItems$"].(map[string]any)["minLength"]; ok {
+		t.Error("minLength constraint inside a patternProperties entry survived")
+	}
+
+	// A malformed name-keyed value must not panic.
+	stripNativeOutputKeywords(map[string]any{"properties": "not-a-map"})
+}
