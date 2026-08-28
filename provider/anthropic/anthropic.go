@@ -63,7 +63,7 @@ var anthropicProtectedKeys = map[string]bool{
 	"tools": true, "tool_choice": true,
 	// SDK-internal keys that are never sent on the wire.
 	"structuredOutputMode": true, "sendReasoning": true,
-	"cacheControl": true,
+	"cacheControl": true, "streamingTransport": true,
 }
 
 // Option configures the Anthropic provider.
@@ -340,7 +340,12 @@ func (m *chatModel) DoGenerate(ctx context.Context, params provider.GeneratePara
 			return nil, err
 		}
 	}
-	body := m.buildRequest(params, false)
+	// Long-running requests are issued with stream:true and reassembled
+	// into the same Message document a non-streaming call would have
+	// returned. Transport only — the result is indistinguishable to the
+	// caller. See useStreamingTransport.
+	streaming := m.useStreamingTransport(params)
+	body := m.buildRequest(params, streaming)
 	toolBetas := collectToolBetas(params.Tools)
 	if hasRemoteRef(params.Messages) {
 		toolBetas = append(toolBetas, filesBetaHeader)
@@ -352,7 +357,12 @@ func (m *chatModel) DoGenerate(ctx context.Context, params provider.GeneratePara
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	var respBody []byte
+	if streaming {
+		respBody, err = accumulateStreamedMessage(ctx, resp.Body)
+	} else {
+		respBody, err = io.ReadAll(resp.Body)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
@@ -945,6 +955,56 @@ func modelIDMatches(id, base string) bool {
 		return true
 	}
 	return false
+}
+
+// useStreamingTransport reports whether DoGenerate should issue its request
+// with stream:true and reassemble the streamed events into a complete
+// Message, instead of waiting on a single non-streaming response.
+//
+// Anthropic's guidance is to stream long-running requests. A non-streaming
+// call holds an HTTP response open with no bytes flowing until the model has
+// finished everything it intends to do, so a request that thinks for minutes
+// is exposed to idle-timeout enforcement — by the client, and by any proxy
+// or load balancer in between. Thinking is where that bites, and since the
+// 5.x generation thinks with no thinking parameter sent at all, it is the
+// common case rather than an opt-in one.
+//
+// This matters most in a tool loop. GenerateObject is the only structured-
+// output entry point that runs tools (StreamObject is single-step by
+// design), and it drives every step through DoGenerate — so before this,
+// native structured output plus tools plus a thinking model was reachable
+// only over the non-streaming transport, which is exactly the combination
+// the guidance warns against.
+//
+// Callers can force the decision either way with
+// ProviderOptions["streamingTransport"] = true / false.
+func (m *chatModel) useStreamingTransport(params provider.GenerateParams) bool {
+	if v, ok := params.ProviderOptions["streamingTransport"].(bool); ok {
+		return v
+	}
+	return m.willThink(params)
+}
+
+// willThink reports whether a request is expected to produce thinking, and
+// therefore to run long.
+//
+// Two ways that happens: the caller asked for it (a "thinking" or "effort"
+// provider option), or the model thinks by default with no thinking
+// parameter sent — true from the 5.x generation onward. Opus 4.7/4.8 support
+// adaptive thinking but only when it is requested, so they qualify via the
+// first branch only.
+func (m *chatModel) willThink(params provider.GenerateParams) bool {
+	if !supportsThinking(m.id) {
+		return false
+	}
+	if _, ok := params.ProviderOptions["thinking"]; ok {
+		return true
+	}
+	if _, ok := params.ProviderOptions["effort"]; ok {
+		return true
+	}
+	major, _, ok := anthropicModelVersion(m.id)
+	return ok && major >= 5
 }
 
 // injectNativeOutputFormat stores the structured-output schema in
@@ -1646,6 +1706,200 @@ var serverToolResultBlockTypes = map[string]bool{
 
 func isServerToolResultBlock(t string) bool {
 	return serverToolResultBlockTypes[t]
+}
+
+// accumulateStreamedMessage reads Anthropic's SSE event stream and
+// reassembles the single Message object those events describe, returning the
+// JSON bytes as though the request had been issued non-streaming.
+//
+// Rebuilding the wire document, rather than mapping events onto
+// provider.GenerateResult directly, is the deliberate part. parseResponse is
+// the one place that knows how to interpret a Message, and it reads several
+// things provider.StreamChunk has no field for: thinking-block signatures
+// (which must be replayed verbatim on the next turn), redacted_thinking
+// payloads, server tool result blocks, citations, and container /
+// context_management metadata. Reassembling the document keeps DoGenerate's
+// two transports identical in everything but transport; mapping events would
+// fork that logic and silently drop whatever a chunk cannot carry.
+//
+// An "error" event is returned as-is: parseResponse already recognises the
+// {"type":"error"} envelope and converts it to an APIError or
+// ContextOverflowError, so error classification stays in one place too.
+func accumulateStreamedMessage(ctx context.Context, body io.Reader) ([]byte, error) {
+	scanner := sse.NewScanner(body)
+
+	var message map[string]any
+	var content []map[string]any
+	// Anthropic sends tool input as a JSON string split across
+	// input_json_delta fragments, keyed by content block index. Fragments are
+	// only valid JSON once concatenated, so they are buffered until
+	// content_block_stop.
+	toolInput := map[int]*strings.Builder{}
+
+	blockAt := func(idx int) map[string]any {
+		if idx < 0 {
+			idx = 0
+		}
+		for len(content) <= idx {
+			content = append(content, map[string]any{})
+		}
+		return content[idx]
+	}
+
+	for data, ok := scanner.Next(); ok; data, ok = scanner.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		var event map[string]any
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			// Matches parseSSE: a frame we cannot parse is skipped rather
+			// than failing the whole response.
+			continue
+		}
+
+		switch eventType, _ := event["type"].(string); eventType {
+		case "message_start":
+			if msg, ok := event["message"].(map[string]any); ok {
+				message = msg
+				// content arrives as separate events; rebuild it from those
+				// rather than trusting the (empty) array in the envelope.
+				if existing, ok := msg["content"].([]any); ok {
+					for _, b := range existing {
+						if bm, ok := b.(map[string]any); ok {
+							content = append(content, bm)
+						}
+					}
+				}
+			}
+
+		case "content_block_start":
+			idx := eventIndex(event)
+			block, _ := event["content_block"].(map[string]any)
+			if block == nil {
+				block = map[string]any{}
+			}
+			blockAt(idx)
+			content[idx] = block
+
+		case "content_block_delta":
+			idx := eventIndex(event)
+			delta, _ := event["delta"].(map[string]any)
+			if delta == nil {
+				continue
+			}
+			block := blockAt(idx)
+			switch deltaType, _ := delta["type"].(string); deltaType {
+			case "text_delta":
+				appendStringField(block, "text", delta["text"])
+			case "thinking_delta":
+				appendStringField(block, "thinking", delta["thinking"])
+			case "signature_delta":
+				appendStringField(block, "signature", delta["signature"])
+			case "input_json_delta":
+				if fragment, ok := delta["partial_json"].(string); ok {
+					sb := toolInput[idx]
+					if sb == nil {
+						sb = &strings.Builder{}
+						toolInput[idx] = sb
+					}
+					sb.WriteString(fragment)
+				}
+			case "citations_delta":
+				if citation, ok := delta["citation"].(map[string]any); ok {
+					existing, _ := block["citations"].([]any)
+					block["citations"] = append(existing, citation)
+				}
+			}
+
+		case "content_block_stop":
+			idx := eventIndex(event)
+			sb := toolInput[idx]
+			if sb == nil {
+				continue
+			}
+			delete(toolInput, idx)
+			var input any
+			if err := json.Unmarshal([]byte(cmp.Or(sb.String(), "{}")), &input); err == nil {
+				blockAt(idx)["input"] = input
+			}
+			// A fragment set that does not parse leaves the block's original
+			// input in place, mirroring parseSSE's "{}" fallback rather than
+			// failing the response.
+
+		case "message_delta":
+			if message == nil {
+				continue
+			}
+			// stop_reason, stop_sequence and container all arrive inside
+			// delta, at the same position they occupy in a complete Message.
+			if delta, ok := event["delta"].(map[string]any); ok {
+				for k, v := range delta {
+					message[k] = v
+				}
+			}
+			// usage and context_management arrive at the event's top level.
+			if u, ok := event["usage"].(map[string]any); ok {
+				existing, _ := message["usage"].(map[string]any)
+				if existing == nil {
+					existing = map[string]any{}
+					message["usage"] = existing
+				}
+				// message_start's usage carries input-side counts; the delta
+				// supersedes the output-side ones it repeats.
+				for k, v := range u {
+					existing[k] = v
+				}
+			}
+			if cm, ok := event["context_management"]; ok {
+				message["context_management"] = cm
+			}
+
+		case "error":
+			return []byte(data), nil
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("reading stream: %w", err)
+	}
+	if message == nil {
+		// No message_start: either an empty body or a stream that failed
+		// before the envelope arrived.
+		return nil, &goai.APIError{Message: "anthropic: stream ended before message_start"}
+	}
+
+	// A stream truncated after message_start still yields whatever content
+	// arrived; parseResponse maps the absent stop_reason to FinishOther,
+	// which is more useful to a caller than discarding the response.
+	message["content"] = content
+	out, err := json.Marshal(message)
+	if err != nil {
+		return nil, fmt.Errorf("reassembling streamed message: %w", err)
+	}
+	return out, nil
+}
+
+// eventIndex reads an SSE event's content block index. A missing or
+// non-numeric index is treated as 0, which is the only block a stream
+// omitting the field could be describing.
+func eventIndex(event map[string]any) int {
+	idx, _ := event["index"].(float64)
+	if idx < 0 {
+		return 0
+	}
+	return int(idx)
+}
+
+// appendStringField concatenates a streamed delta onto a content block field,
+// creating it when the first fragment arrives.
+func appendStringField(block map[string]any, key string, value any) {
+	fragment, ok := value.(string)
+	if !ok {
+		return
+	}
+	existing, _ := block[key].(string)
+	block[key] = existing + fragment
 }
 
 func parseResponse(body []byte) (*provider.GenerateResult, error) {

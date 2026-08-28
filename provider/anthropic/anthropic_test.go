@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -4302,5 +4303,408 @@ func TestTransformNativeOutputSchema_PropertyNameCollision(t *testing.T) {
 	// A malformed name-keyed value must not panic.
 	if _, err := transformNativeOutputSchema(map[string]any{"properties": "not-a-map"}); err == nil {
 		t.Error("expected an error for a non-object properties value")
+	}
+}
+
+// sseFrames joins event JSON documents into an SSE body.
+func sseFrames(events ...string) string {
+	var b strings.Builder
+	for _, e := range events {
+		b.WriteString("data: " + e + "\n\n")
+	}
+	return b.String()
+}
+
+// TestAccumulateStreamedMessage_Parity is the load-bearing test for the
+// streaming transport: the same Message delivered as an event stream and as a
+// single non-streaming response must parse to identical results. If this
+// holds, DoGenerate's two transports are interchangeable by construction and
+// no field can be silently lost in reassembly.
+//
+// Tool inputs in the complete fixtures are written in Go's canonical
+// marshalling form (keys sorted, no whitespace) because the streamed side is
+// re-marshalled from a decoded map; a semantically equal but differently
+// formatted fixture would fail on json.RawMessage byte comparison.
+func TestAccumulateStreamedMessage_Parity(t *testing.T) {
+	tests := []struct {
+		name     string
+		stream   string
+		complete string
+	}{
+		{
+			name: "text only",
+			stream: sseFrames(
+				`{"type":"message_start","message":{"id":"msg_1","model":"claude-sonnet-5","type":"message","role":"assistant","content":[],"usage":{"input_tokens":15,"cache_read_input_tokens":5}}}`,
+				`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}`,
+				`{"type":"content_block_stop","index":0}`,
+				`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8}}`,
+				`{"type":"message_stop"}`,
+			),
+			complete: `{"id":"msg_1","model":"claude-sonnet-5","type":"message","role":"assistant","content":[{"type":"text","text":"Hello world"}],"stop_reason":"end_turn","usage":{"input_tokens":15,"cache_read_input_tokens":5,"output_tokens":8}}`,
+		},
+		{
+			name: "thinking block with signature is preserved verbatim",
+			stream: sseFrames(
+				`{"type":"message_start","message":{"id":"msg_2","model":"claude-opus-5","type":"message","role":"assistant","content":[],"usage":{"input_tokens":20}}}`,
+				`{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me "}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"consider."}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EqQBCgIY"}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"AhgCIkAw"}}`,
+				`{"type":"content_block_stop","index":0}`,
+				`{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`,
+				`{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Answer."}}`,
+				`{"type":"content_block_stop","index":1}`,
+				`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":30,"output_tokens_details":{"thinking_tokens":22}}}`,
+				`{"type":"message_stop"}`,
+			),
+			complete: `{"id":"msg_2","model":"claude-opus-5","type":"message","role":"assistant","content":[{"type":"thinking","thinking":"Let me consider.","signature":"EqQBCgIYAhgCIkAw"},{"type":"text","text":"Answer."}],"stop_reason":"end_turn","usage":{"input_tokens":20,"output_tokens":30,"output_tokens_details":{"thinking_tokens":22}}}`,
+		},
+		{
+			name: "tool_use input reassembled from fragments",
+			stream: sseFrames(
+				`{"type":"message_start","message":{"id":"msg_3","model":"claude-sonnet-5","type":"message","role":"assistant","content":[],"usage":{"input_tokens":30}}}`,
+				`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"read","input":{}}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\""}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":":\"a.go\"}"}}`,
+				`{"type":"content_block_stop","index":0}`,
+				`{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":12}}`,
+				`{"type":"message_stop"}`,
+			),
+			complete: `{"id":"msg_3","model":"claude-sonnet-5","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"read","input":{"path":"a.go"}}],"stop_reason":"tool_use","usage":{"input_tokens":30,"output_tokens":12}}`,
+		},
+		{
+			name: "redacted_thinking arrives complete in content_block_start",
+			stream: sseFrames(
+				`{"type":"message_start","message":{"id":"msg_4","model":"claude-opus-5","type":"message","role":"assistant","content":[],"usage":{"input_tokens":10}}}`,
+				`{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"EncryptedPayload"}}`,
+				`{"type":"content_block_stop","index":0}`,
+				`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}`,
+				`{"type":"message_stop"}`,
+			),
+			complete: `{"id":"msg_4","model":"claude-opus-5","type":"message","role":"assistant","content":[{"type":"redacted_thinking","data":"EncryptedPayload"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":4}}`,
+		},
+		{
+			name: "usage iterations and context_management",
+			stream: sseFrames(
+				`{"type":"message_start","message":{"id":"msg_5","model":"claude-sonnet-5","type":"message","role":"assistant","content":[],"usage":{"input_tokens":5}}}`,
+				`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`,
+				`{"type":"content_block_stop","index":0}`,
+				`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3,"iterations":[{"type":"assistant","input_tokens":5,"output_tokens":3}]},"context_management":{"applied_edits":[{"type":"clear_tool_uses_20250919"}]}}`,
+				`{"type":"message_stop"}`,
+			),
+			complete: `{"id":"msg_5","model":"claude-sonnet-5","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":3,"iterations":[{"type":"assistant","input_tokens":5,"output_tokens":3}]},"context_management":{"applied_edits":[{"type":"clear_tool_uses_20250919"}]}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			accumulated, err := accumulateStreamedMessage(t.Context(), strings.NewReader(tt.stream))
+			if err != nil {
+				t.Fatalf("accumulateStreamedMessage: %v", err)
+			}
+
+			gotStreamed, err := parseResponse(accumulated)
+			if err != nil {
+				t.Fatalf("parseResponse(streamed): %v", err)
+			}
+			gotComplete, err := parseResponse([]byte(tt.complete))
+			if err != nil {
+				t.Fatalf("parseResponse(complete): %v", err)
+			}
+
+			if !reflect.DeepEqual(gotStreamed, gotComplete) {
+				t.Errorf("streamed and non-streaming results differ\nstreamed: %#v\ncomplete: %#v\nreassembled JSON: %s",
+					gotStreamed, gotComplete, accumulated)
+			}
+		})
+	}
+}
+
+func TestAccumulateStreamedMessage_ErrorEvent(t *testing.T) {
+	stream := sseFrames(
+		`{"type":"message_start","message":{"id":"msg_e","model":"claude-sonnet-5","content":[]}}`,
+		`{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`,
+	)
+
+	body, err := accumulateStreamedMessage(t.Context(), strings.NewReader(stream))
+	if err != nil {
+		t.Fatalf("accumulateStreamedMessage: %v", err)
+	}
+
+	// The error envelope is handed to parseResponse unchanged so that error
+	// classification stays in one place.
+	if _, err = parseResponse(body); err == nil {
+		t.Fatal("expected parseResponse to report the streamed error event")
+	}
+	var apiErr *goai.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected *goai.APIError, got %T: %v", err, err)
+	}
+	if !strings.Contains(apiErr.Message, "Overloaded") {
+		t.Errorf("error message = %q, want it to mention Overloaded", apiErr.Message)
+	}
+}
+
+func TestAccumulateStreamedMessage_NoMessageStart(t *testing.T) {
+	if _, err := accumulateStreamedMessage(t.Context(), strings.NewReader("")); err == nil {
+		t.Fatal("expected an error when the stream carries no message_start")
+	}
+}
+
+func TestAccumulateStreamedMessage_TruncatedStream(t *testing.T) {
+	// A stream cut off mid-message still yields the content that arrived;
+	// discarding it would lose a partial answer the caller can use.
+	stream := sseFrames(
+		`{"type":"message_start","message":{"id":"msg_t","model":"claude-sonnet-5","type":"message","content":[],"usage":{"input_tokens":9}}}`,
+		`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`,
+	)
+
+	body, err := accumulateStreamedMessage(t.Context(), strings.NewReader(stream))
+	if err != nil {
+		t.Fatalf("accumulateStreamedMessage: %v", err)
+	}
+	result, err := parseResponse(body)
+	if err != nil {
+		t.Fatalf("parseResponse: %v", err)
+	}
+	if result.Text != "partial" {
+		t.Errorf("Text = %q, want %q", result.Text, "partial")
+	}
+}
+
+func TestAccumulateStreamedMessage_MalformedFrameSkipped(t *testing.T) {
+	stream := sseFrames(
+		`{"type":"message_start","message":{"id":"msg_m","model":"claude-sonnet-5","type":"message","content":[],"usage":{"input_tokens":1}}}`,
+		`not json at all`,
+		`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"fine"}}`,
+		`{"type":"content_block_stop","index":0}`,
+		`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`,
+		`{"type":"message_stop"}`,
+	)
+
+	body, err := accumulateStreamedMessage(t.Context(), strings.NewReader(stream))
+	if err != nil {
+		t.Fatalf("accumulateStreamedMessage: %v", err)
+	}
+	result, err := parseResponse(body)
+	if err != nil {
+		t.Fatalf("parseResponse: %v", err)
+	}
+	if result.Text != "fine" {
+		t.Errorf("Text = %q, want %q", result.Text, "fine")
+	}
+}
+
+func TestAccumulateStreamedMessage_UnparseableToolInputKeepsBlock(t *testing.T) {
+	// Fragments that never form valid JSON must not discard the tool call
+	// itself; the block's original input stands.
+	stream := sseFrames(
+		`{"type":"message_start","message":{"id":"msg_u","model":"claude-sonnet-5","type":"message","content":[],"usage":{"input_tokens":1}}}`,
+		`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_9","name":"read","input":{}}}`,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}`,
+		`{"type":"content_block_stop","index":0}`,
+		`{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":2}}`,
+		`{"type":"message_stop"}`,
+	)
+
+	body, err := accumulateStreamedMessage(t.Context(), strings.NewReader(stream))
+	if err != nil {
+		t.Fatalf("accumulateStreamedMessage: %v", err)
+	}
+	result, err := parseResponse(body)
+	if err != nil {
+		t.Fatalf("parseResponse: %v", err)
+	}
+	if len(result.ToolCalls) != 1 {
+		t.Fatalf("ToolCalls = %d, want 1", len(result.ToolCalls))
+	}
+	if result.ToolCalls[0].Name != "read" {
+		t.Errorf("tool name = %q, want read", result.ToolCalls[0].Name)
+	}
+}
+
+func TestWillThink(t *testing.T) {
+	tests := []struct {
+		name    string
+		modelID string
+		opts    map[string]any
+		want    bool
+	}{
+		{name: "5.x thinks with no parameter at all", modelID: "claude-sonnet-5", want: true},
+		{name: "opus 5 thinks by default", modelID: "claude-opus-5", want: true},
+		{name: "fable 5 thinks by default", modelID: "claude-fable-5", want: true},
+		{name: "4.8 only on request", modelID: "claude-opus-4-8", want: false},
+		{
+			name:    "4.8 with explicit thinking",
+			modelID: "claude-opus-4-8",
+			opts:    map[string]any{"thinking": map[string]any{"type": "adaptive"}},
+			want:    true,
+		},
+		{
+			name:    "4.7 with effort",
+			modelID: "claude-opus-4-7",
+			opts:    map[string]any{"effort": "medium"},
+			want:    true,
+		},
+		{
+			name:    "4.6 with budget_tokens thinking",
+			modelID: "claude-sonnet-4-6",
+			opts:    map[string]any{"thinking": map[string]any{"type": "enabled", "budgetTokens": 4000}},
+			want:    true,
+		},
+		{name: "4.6 without thinking", modelID: "claude-sonnet-4-6", want: false},
+		{
+			name:    "model that cannot think ignores the option",
+			modelID: "claude-3-5-sonnet-20241022",
+			opts:    map[string]any{"thinking": map[string]any{"type": "enabled"}},
+			want:    false,
+		},
+		{name: "bedrock-prefixed 5.x still detected", modelID: "us.anthropic.claude-sonnet-5", want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := &chatModel{id: tt.modelID}
+			got := m.willThink(provider.GenerateParams{ProviderOptions: tt.opts})
+			if got != tt.want {
+				t.Errorf("willThink(%q) = %v, want %v", tt.modelID, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUseStreamingTransport_ExplicitOverride(t *testing.T) {
+	tests := []struct {
+		name    string
+		modelID string
+		opts    map[string]any
+		want    bool
+	}{
+		{
+			name:    "explicit false beats thinks-by-default",
+			modelID: "claude-sonnet-5",
+			opts:    map[string]any{"streamingTransport": false},
+			want:    false,
+		},
+		{
+			name:    "explicit true beats a non-thinking model",
+			modelID: "claude-sonnet-4-6",
+			opts:    map[string]any{"streamingTransport": true},
+			want:    true,
+		},
+		{
+			name:    "non-bool value falls through to willThink",
+			modelID: "claude-sonnet-5",
+			opts:    map[string]any{"streamingTransport": "yes"},
+			want:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := &chatModel{id: tt.modelID}
+			got := m.useStreamingTransport(provider.GenerateParams{ProviderOptions: tt.opts})
+			if got != tt.want {
+				t.Errorf("useStreamingTransport = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDoGenerate_UsesStreamingTransportForThinkingModels is the end-to-end
+// check: a thinking model's DoGenerate must request stream:true, consume SSE,
+// and still return a normal GenerateResult — including the thinking signature
+// that provider.StreamChunk cannot carry.
+func TestDoGenerate_UsesStreamingTransportForThinkingModels(t *testing.T) {
+	var gotStream any
+	var gotStreamingTransportOnWire bool
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotStream = body["stream"]
+		_, gotStreamingTransportOnWire = body["streamingTransport"]
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, sseFrames(
+			`{"type":"message_start","message":{"id":"msg_e2e","model":"claude-sonnet-5","type":"message","role":"assistant","content":[],"usage":{"input_tokens":11}}}`,
+			`{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}`,
+			`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}`,
+			`{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"SigABC"}}`,
+			`{"type":"content_block_stop","index":0}`,
+			`{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`,
+			`{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"done"}}`,
+			`{"type":"content_block_stop","index":1}`,
+			`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}`,
+			`{"type":"message_stop"}`,
+		))
+	}))
+	defer server.Close()
+
+	model := Chat("claude-sonnet-5", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	result, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("DoGenerate: %v", err)
+	}
+
+	if gotStream != true {
+		t.Errorf("request stream = %v, want true", gotStream)
+	}
+	if gotStreamingTransportOnWire {
+		t.Error("streamingTransport leaked onto the wire; it is an SDK-internal key")
+	}
+	if result.Text != "done" {
+		t.Errorf("Text = %q, want %q", result.Text, "done")
+	}
+	if result.Reasoning != "hmm" {
+		t.Errorf("Reasoning = %q, want %q", result.Reasoning, "hmm")
+	}
+	if result.Usage.OutputTokens != 7 {
+		t.Errorf("OutputTokens = %d, want 7", result.Usage.OutputTokens)
+	}
+	// The signature is the field a chunk-based reassembly would have dropped.
+	if !strings.Contains(fmt.Sprint(result.ProviderMetadata), "SigABC") {
+		t.Errorf("thinking signature missing from ProviderMetadata: %v", result.ProviderMetadata)
+	}
+}
+
+func TestDoGenerate_NonThinkingModelStaysNonStreaming(t *testing.T) {
+	var gotStream any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotStream = body["stream"]
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"msg_ns","model":"claude-sonnet-4-6","type":"message","role":"assistant","content":[{"type":"text","text":"plain"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":2}}`)
+	}))
+	defer server.Close()
+
+	model := Chat("claude-sonnet-4-6", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	result, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("DoGenerate: %v", err)
+	}
+
+	if gotStream != false {
+		t.Errorf("request stream = %v, want false for a non-thinking model", gotStream)
+	}
+	if result.Text != "plain" {
+		t.Errorf("Text = %q, want %q", result.Text, "plain")
 	}
 }
