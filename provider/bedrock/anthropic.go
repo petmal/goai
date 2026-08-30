@@ -81,6 +81,9 @@ func AnthropicChat(modelID string, opts ...Option) provider.LanguageModel {
 		anthropic.WithErrorProvider("bedrock-anthropic"),
 		anthropic.WithHTTPClient(signing),
 		anthropic.WithSkipEnvResolve(),
+		// Bedrock documents a narrower structured-output set than the direct
+		// Claude API (Opus 4.6, Sonnet 4.6, Sonnet 4.5, Opus 4.5, Haiku 4.5).
+		anthropic.WithNativeOutputFormatSupport(anthropic.NativeOutputFormatBedrock),
 	}
 	// Provide a placeholder token source so the anthropic provider's auth
 	// resolution is satisfied. The transport below replaces the request's

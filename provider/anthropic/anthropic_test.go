@@ -784,7 +784,11 @@ func TestBuildRequest_NativeOutputFormat(t *testing.T) {
 	if !m.useNativeOutputFormat(params) {
 		t.Fatal("useNativeOutputFormat = false, want true for structuredOutputMode=outputFormat")
 	}
-	params = injectNativeOutputFormat(params)
+	var err error
+	params, err = injectNativeOutputFormat(params)
+	if err != nil {
+		t.Fatalf("injectNativeOutputFormat: %v", err)
+	}
 	body := m.buildRequest(params, false)
 
 	// The deprecated top-level field must not be present.
@@ -2561,7 +2565,10 @@ func TestInjectNativeOutputFormat_NilProviderOptions(t *testing.T) {
 			Schema: json.RawMessage(`{"type":"object"}`),
 		},
 	}
-	result := injectNativeOutputFormat(params)
+	result, err := injectNativeOutputFormat(params)
+	if err != nil {
+		t.Fatalf("injectNativeOutputFormat: %v", err)
+	}
 	if result.ProviderOptions == nil {
 		t.Fatal("expected ProviderOptions to be initialized")
 	}
@@ -2578,7 +2585,8 @@ func TestInjectNativeOutputFormat_NilProviderOptions(t *testing.T) {
 	}
 }
 
-// injectNativeOutputFormat with invalid schema bytes (covers unmarshal error fallback).
+// injectNativeOutputFormat with invalid schema bytes must surface an error
+// rather than silently dropping the requested output mode.
 func TestInjectNativeOutputFormat_InvalidSchema(t *testing.T) {
 	params := provider.GenerateParams{
 		ResponseFormat: &provider.ResponseFormat{
@@ -2586,8 +2594,11 @@ func TestInjectNativeOutputFormat_InvalidSchema(t *testing.T) {
 		},
 		ProviderOptions: map[string]any{"existing": "value"},
 	}
-	result := injectNativeOutputFormat(params)
-	// Should return original params unchanged (fall back to tool trick).
+	result, err := injectNativeOutputFormat(params)
+	if err == nil {
+		t.Fatal("expected an error for an invalid schema, got nil")
+	}
+	// ResponseFormat must not be cleared and output_format must not be set.
 	if result.ResponseFormat == nil {
 		t.Error("ResponseFormat should NOT be cleared when schema is invalid")
 	}
@@ -3241,7 +3252,10 @@ func TestInjectNativeOutputFormat_NilResponseFormat(t *testing.T) {
 	params := provider.GenerateParams{
 		ProviderOptions: map[string]any{"existing": "value"},
 	}
-	result := injectNativeOutputFormat(params)
+	result, err := injectNativeOutputFormat(params)
+	if err != nil {
+		t.Fatalf("injectNativeOutputFormat: %v", err)
+	}
 	// Should return the original params (not the copy with cloned ProviderOptions).
 	if result.ProviderOptions["existing"] != "value" {
 		t.Error("should preserve original ProviderOptions")
@@ -3958,14 +3972,12 @@ func TestSupportsNativeOutputFormat(t *testing.T) {
 		id   string
 		want bool
 	}{
-		// Previously matched by the literal list -- must not regress.
+		// Documented direct-Claude API compatibility set.
 		{"claude-sonnet-4-6", true},
 		{"claude-sonnet-4-6-20260310", true},
 		{"claude-opus-4-6", true},
 		{"claude-sonnet-4-5", true},
 		{"claude-opus-4-5", true},
-		{"claude-opus-4-1", true},
-		// Previously false despite supporting structured output.
 		{"claude-opus-4-7", true},
 		{"claude-opus-4-8", true},
 		{"claude-haiku-4-5-20251001", true},
@@ -3973,8 +3985,16 @@ func TestSupportsNativeOutputFormat(t *testing.T) {
 		{"claude-sonnet-5", true},
 		{"claude-fable-5", true},
 		{"claude-mythos-5", true},
-		{"anthropic.claude-opus-5", true},
+		{"claude-mythos-preview", true},
+		// Release-date and platform aliases.
 		{"claude-opus-4-5@20251101", true},
+		{"anthropic.claude-opus-5", true},
+		{"us.anthropic.claude-sonnet-4-6", true},
+		// Not on the documented list, despite a version >= 4.1.
+		{"claude-opus-4-1", false},
+		{"claude-opus-4-1-20250101", false},
+		{"claude-opus-4-9", false},
+		{"claude-opus-6", false},
 		// The 4.0 release predates structured output, bare or dated.
 		{"claude-sonnet-4-20250514", false},
 		{"claude-opus-4-20250514", false},
@@ -3993,7 +4013,46 @@ func TestSupportsNativeOutputFormat(t *testing.T) {
 	}
 }
 
-func TestStripNativeOutputKeywords(t *testing.T) {
+func TestSupportsNativeOutputFormat_Bedrock(t *testing.T) {
+	bedrock := &chatModel{id: "x", opts: options{nativeOutputFormatModels: bedrockNativeOutputFormatModels}}
+	cases := []struct {
+		id   string
+		want bool
+	}{
+		// Documented Bedrock subset.
+		{"claude-opus-4-6", true},
+		{"anthropic.claude-opus-4-6", true},
+		{"claude-sonnet-4-6", true},
+		{"us.anthropic.claude-sonnet-4-6", true},
+		{"claude-sonnet-4-5", true},
+		{"claude-opus-4-5", true},
+		{"claude-haiku-4-5", true},
+		// Not in the Bedrock subset even though the direct API supports them.
+		{"claude-opus-5", false},
+		{"claude-sonnet-5", false},
+		{"claude-fable-5", false},
+		{"claude-mythos-preview", false},
+		{"claude-opus-4-7", false},
+		{"claude-opus-4-8", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.id, func(t *testing.T) {
+			bedrock.id = tc.id
+			if got := bedrock.supportsNativeOutputFormat(); got != tc.want {
+				t.Errorf("bedrock supportsNativeOutputFormat(%q) = %v, want %v", tc.id, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSupportsNativeOutputFormat_Disabled(t *testing.T) {
+	m := &chatModel{id: "claude-opus-5", opts: options{nativeOutputFormatModels: []string{}}}
+	if m.supportsNativeOutputFormat() {
+		t.Error("native structured output must be disabled when the adapter opts out")
+	}
+}
+
+func TestTransformNativeOutputSchema(t *testing.T) {
 	in := map[string]any{
 		"type":                 "object",
 		"additionalProperties": false,
@@ -4021,29 +4080,14 @@ func TestStripNativeOutputKeywords(t *testing.T) {
 		},
 	}
 
-	got, ok := stripNativeOutputKeywords(in).(map[string]any)
+	gotVal, err := transformNativeOutputSchema(in)
+	if err != nil {
+		t.Fatalf("transformNativeOutputSchema: %v", err)
+	}
+	got, ok := gotVal.(map[string]any)
 	if !ok {
-		t.Fatalf("stripNativeOutputKeywords returned %T, want map", got)
+		t.Fatalf("transformNativeOutputSchema returned %T, want map", gotVal)
 	}
-
-	// Every unsupported keyword must be gone, at every depth.
-	var walk func(any)
-	walk = func(node any) {
-		switch n := node.(type) {
-		case map[string]any:
-			for k, v := range n {
-				if nativeOutputUnsupportedKeywords[k] {
-					t.Errorf("unsupported keyword %q survived sanitisation", k)
-				}
-				walk(v)
-			}
-		case []any:
-			for _, v := range n {
-				walk(v)
-			}
-		}
-	}
-	walk(got)
 
 	// Supported constructs must survive untouched.
 	props := got["properties"].(map[string]any)
@@ -4065,12 +4109,74 @@ func TestStripNativeOutputKeywords(t *testing.T) {
 	if anyOf := props["either"].(map[string]any)["anyOf"].([]any); len(anyOf) != 2 {
 		t.Errorf("anyOf must survive: %#v", anyOf)
 	}
+	// minItems 0/1 is supported and must be preserved, not dropped.
+	if tags := props["tags"].(map[string]any); tags["minItems"] != float64(1) {
+		t.Errorf("minItems:1 must survive: %#v", tags)
+	}
+
+	// Unsupported constraints must not appear as schema keys, but must be
+	// recorded in a description rather than silently dropped.
+	collected := collectDescriptions(got)
+	for _, kw := range []string{"minimum", "maximum", "minLength", "uniqueItems", "multipleOf", "maxLength"} {
+		if keyPresent(got, kw) {
+			t.Errorf("unsupported keyword %q survived as a schema key", kw)
+		}
+		if !strings.Contains(collected, kw) {
+			t.Errorf("unsupported keyword %q not recorded in a description", kw)
+		}
+	}
 
 	// Input must not be mutated.
 	origConf := in["properties"].(map[string]any)["confidence"].(map[string]any)
 	if _, stillThere := origConf["minimum"]; !stillThere {
-		t.Error("stripNativeOutputKeywords mutated its input")
+		t.Error("transformNativeOutputSchema mutated its input")
 	}
+}
+
+// keyPresent reports whether the keyword appears as a schema key anywhere.
+func keyPresent(node any, keyword string) bool {
+	switch n := node.(type) {
+	case map[string]any:
+		if _, ok := n[keyword]; ok {
+			return true
+		}
+		for _, v := range n {
+			if keyPresent(v, keyword) {
+				return true
+			}
+		}
+	case []any:
+		for _, v := range n {
+			if keyPresent(v, keyword) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// collectDescriptions concatenates every "description" value in the schema.
+func collectDescriptions(node any) string {
+	var sb strings.Builder
+	var walk func(any)
+	walk = func(n any) {
+		switch v := n.(type) {
+		case map[string]any:
+			if d, ok := v["description"].(string); ok {
+				sb.WriteString(d)
+				sb.WriteString("\n")
+			}
+			for _, sub := range v {
+				walk(sub)
+			}
+		case []any:
+			for _, sub := range v {
+				walk(sub)
+			}
+		}
+	}
+	walk(node)
+	return sb.String()
 }
 
 func TestBuildRequest_NativeOutputFormat_SanitisesSchema(t *testing.T) {
@@ -4086,34 +4192,49 @@ func TestBuildRequest_NativeOutputFormat_SanitisesSchema(t *testing.T) {
 		ProviderOptions: map[string]any{"structuredOutputMode": "outputFormat"},
 	}
 
-	params = injectNativeOutputFormat(params)
+	var err error
+	params, err = injectNativeOutputFormat(params)
+	if err != nil {
+		t.Fatalf("injectNativeOutputFormat: %v", err)
+	}
 	body := m.buildRequest(params, false)
 
 	raw, err := json.Marshal(body["output_config"])
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, kw := range []string{"minimum", "maximum"} {
-		if strings.Contains(string(raw), `"`+kw+`"`) {
+	// The unsupported numeric constraints must not appear as schema keys.
+	for _, kw := range []string{`"minimum":`, `"maximum":`} {
+		if strings.Contains(string(raw), kw) {
 			t.Errorf("output_config still carries %q: %s", kw, raw)
 		}
 	}
-	// The schema itself must still be there and still be usable.
+	// The schema body and format type must still be present.
 	if !strings.Contains(string(raw), `"confidence"`) {
-		t.Errorf("sanitisation dropped the schema body: %s", raw)
+		t.Errorf("transformation dropped the schema body: %s", raw)
 	}
 	if !strings.Contains(string(raw), `"json_schema"`) {
 		t.Errorf("output_config.format.type lost: %s", raw)
 	}
 }
 
-// TestStripNativeOutputKeywords_PropertyNameCollision covers the case the
+func TestInjectNativeOutputFormat_InvalidSchema_Errors(t *testing.T) {
+	params := provider.GenerateParams{
+		ResponseFormat:  &provider.ResponseFormat{Schema: json.RawMessage(`{not json`)},
+		ProviderOptions: map[string]any{"structuredOutputMode": "outputFormat"},
+	}
+	if _, err := injectNativeOutputFormat(params); err == nil {
+		t.Error("expected an error for an invalid response format schema, got nil")
+	}
+}
+
+// TestTransformNativeOutputSchema_PropertyNameCollision covers the case the
 // first version of the sanitiser got wrong: a data-model field whose name
 // happens to match a constraint keyword must survive, because keys inside
 // "properties"/"$defs"/etc. are caller-chosen names, not validation keywords.
 // Deleting them silently changed the requested shape and could leave
 // "required" pointing at a property that no longer existed.
-func TestStripNativeOutputKeywords_PropertyNameCollision(t *testing.T) {
+func TestTransformNativeOutputSchema_PropertyNameCollision(t *testing.T) {
 	in := map[string]any{
 		"type":                 "object",
 		"additionalProperties": false,
@@ -4133,7 +4254,11 @@ func TestStripNativeOutputKeywords_PropertyNameCollision(t *testing.T) {
 		},
 	}
 
-	got := stripNativeOutputKeywords(in).(map[string]any)
+	gotVal, err := transformNativeOutputSchema(in)
+	if err != nil {
+		t.Fatalf("transformNativeOutputSchema: %v", err)
+	}
+	got := gotVal.(map[string]any)
 
 	// Every property name survives.
 	props := got["properties"].(map[string]any)
@@ -4145,9 +4270,6 @@ func TestStripNativeOutputKeywords_PropertyNameCollision(t *testing.T) {
 	if _, ok := got["$defs"].(map[string]any)["multipleOf"]; !ok {
 		t.Error(`$defs entry "multipleOf" was deleted`)
 	}
-	if _, ok := got["patternProperties"].(map[string]any)["^minItems$"]; !ok {
-		t.Error(`patternProperties entry "^minItems$" was deleted`)
-	}
 
 	// required stays satisfiable: every name in it still exists in properties.
 	for _, r := range got["required"].([]any) {
@@ -4156,21 +4278,29 @@ func TestStripNativeOutputKeywords_PropertyNameCollision(t *testing.T) {
 		}
 	}
 
-	// Constraints in genuine keyword position are still stripped, including
-	// those nested inside the colliding properties and $defs.
-	if _, ok := props["minimum"].(map[string]any)["minimum"]; ok {
-		t.Error("constraint in keyword position inside a colliding property survived")
-	}
-	if _, ok := props["minLength"].(map[string]any)["minLength"]; ok {
-		t.Error("minLength constraint inside property named minLength survived")
+	// Constraints in genuine keyword position (siblings of "type") are not
+	// carried as keys; they are folded into a description. Note the property
+	// NAMES above legitimately collide with these keywords, so the check is
+	// scoped to each property's own schema, not the whole tree.
+	for _, name := range []string{"minimum", "maximum", "minLength"} {
+		if _, ok := props[name].(map[string]any)[name]; ok {
+			t.Errorf("constraint %q in keyword position inside property %q survived as a schema key", name, name)
+		}
 	}
 	if _, ok := got["$defs"].(map[string]any)["multipleOf"].(map[string]any)["maxLength"]; ok {
-		t.Error("maxLength constraint inside a $defs entry survived")
+		t.Error("maxLength constraint inside a $defs entry survived as a schema key")
 	}
-	if _, ok := got["patternProperties"].(map[string]any)["^minItems$"].(map[string]any)["minLength"]; ok {
-		t.Error("minLength constraint inside a patternProperties entry survived")
+	// patternProperties is not a supported construct; it is recorded in the
+	// description rather than preserved as a key.
+	if _, ok := got["patternProperties"]; ok {
+		t.Error("patternProperties must not survive as a schema key")
+	}
+	if !strings.Contains(collectDescriptions(got), "patternProperties") {
+		t.Error("patternProperties not recorded in a description")
 	}
 
 	// A malformed name-keyed value must not panic.
-	stripNativeOutputKeywords(map[string]any{"properties": "not-a-map"})
+	if _, err := transformNativeOutputSchema(map[string]any{"properties": "not-a-map"}); err == nil {
+		t.Error("expected an error for a non-object properties value")
+	}
 }

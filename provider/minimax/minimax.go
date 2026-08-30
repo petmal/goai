@@ -100,6 +100,10 @@ func Chat(modelID string, opts ...Option) provider.LanguageModel {
 	if len(o.headers) > 0 {
 		anthropicOpts = append(anthropicOpts, anthropic.WithHeaders(o.headers))
 	}
+	// MiniMax does not document support for Anthropic's native
+	// output_config.format, so native structured output stays disabled and the
+	// tool-trick path is used instead.
+	anthropicOpts = append(anthropicOpts, anthropic.WithNativeOutputFormatSupport(anthropic.NativeOutputFormatDisabled))
 
 	return &chatModel{
 		inner: anthropic.Chat(modelID, anthropicOpts...),

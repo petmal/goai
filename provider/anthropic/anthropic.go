@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -94,6 +95,13 @@ type options struct {
 	bodyTransformer BodyTransformer
 	errorProvider   string // provider name for error parsing (default "anthropic")
 	skipEnvResolve  bool   // skip ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL env resolution
+
+	// nativeOutputFormatModels restricts the model IDs for which native
+	// structured output (output_config.format) is enabled in "auto" mode.
+	// nil selects the direct-Anthropic documented list; an empty slice
+	// disables native structured output entirely. Platform adapters set this
+	// to their own documented compatibility set.
+	nativeOutputFormatModels []string
 }
 
 // WithAPIKey sets a static API key for authentication.
@@ -166,6 +174,40 @@ func WithErrorProvider(name string) Option {
 func WithSkipEnvResolve() Option {
 	return func(o *options) {
 		o.skipEnvResolve = true
+	}
+}
+
+// NativeOutputFormatSupport selects which documented model set enables native
+// structured output (output_config.format) in "auto" mode for a platform.
+type NativeOutputFormatSupport int
+
+const (
+	// NativeOutputFormatDirect is the default: the full documented Claude API
+	// compatibility set. Used by the direct API and platforms (Vertex, Azure)
+	// that expose the same set.
+	NativeOutputFormatDirect NativeOutputFormatSupport = iota
+	// NativeOutputFormatBedrock is the narrower documented Amazon Bedrock set.
+	NativeOutputFormatBedrock
+	// NativeOutputFormatDisabled disables native structured output entirely;
+	// the platform does not document support for the field.
+	NativeOutputFormatDisabled
+)
+
+// WithNativeOutputFormatSupport restricts which models enable native
+// structured output (output_config.format) in "auto" mode. Platform adapters
+// whose documented compatibility differs from the direct Claude API set this
+// explicitly (e.g. bedrock.WithNativeOutputFormatSupport(Bedrock),
+// minimax.WithNativeOutputFormatSupport(Disabled)).
+func WithNativeOutputFormatSupport(support NativeOutputFormatSupport) Option {
+	return func(o *options) {
+		switch support {
+		case NativeOutputFormatBedrock:
+			o.nativeOutputFormatModels = bedrockNativeOutputFormatModels
+		case NativeOutputFormatDisabled:
+			o.nativeOutputFormatModels = []string{}
+		default:
+			o.nativeOutputFormatModels = nil
+		}
 	}
 }
 
@@ -245,7 +287,9 @@ func anthropicModelVersion(modelID string) (major, minor int, ok bool) {
 // claude-haiku-4-5, all of which support thinking but matched none of the
 // previous substrings.
 func supportsThinking(modelID string) bool {
-	if strings.Contains(modelID, "claude-3-7-sonnet") {
+	// Legacy and non-versioned aliases that support thinking but carry no
+	// parseable generation number.
+	if strings.Contains(modelID, "claude-3-7-sonnet") || strings.Contains(modelID, "claude-mythos-preview") {
 		return true
 	}
 	major, _, ok := anthropicModelVersion(modelID)
@@ -290,7 +334,11 @@ func (m *chatModel) DoGenerate(ctx context.Context, params provider.GeneratePara
 	if rfMode {
 		params = injectResponseFormatTool(params)
 	} else if useOutputFormat {
-		params = injectNativeOutputFormat(params)
+		var err error
+		params, err = injectNativeOutputFormat(params)
+		if err != nil {
+			return nil, err
+		}
 	}
 	body := m.buildRequest(params, false)
 	toolBetas := collectToolBetas(params.Tools)
@@ -326,7 +374,11 @@ func (m *chatModel) DoStream(ctx context.Context, params provider.GenerateParams
 	if rfMode {
 		params = injectResponseFormatTool(params)
 	} else if useOutputFormat {
-		params = injectNativeOutputFormat(params)
+		var err error
+		params, err = injectNativeOutputFormat(params)
+		if err != nil {
+			return nil, err
+		}
 	}
 	body := m.buildRequest(params, true)
 	toolBetas := collectToolBetas(params.Tools)
@@ -817,34 +869,91 @@ func (m *chatModel) useNativeOutputFormat(params provider.GenerateParams) bool {
 	}
 }
 
-// supportsNativeOutputFormat returns true for models that support native
-// structured output (output_config.format): the Claude 4.1 release and
-// everything after it.
+// directNativeOutputFormatModels is the documented Claude API compatibility set
+// for native structured output (output_config.format), kept explicit so a
+// future model name is not enabled before the platform documentation
+// guarantees it. Release-date aliases (e.g. claude-opus-4-5-20251101) match via
+// modelIDMatches.
 //
-// Version-derived rather than a literal model list. The previous list
-// (claude-sonnet-4-6, claude-opus-4-6, claude-sonnet-4-5, claude-opus-4-5,
-// claude-opus-4-1) had gone stale for every model shipped since: opus-4-7,
-// opus-4-8, haiku-4-5, and the whole 5.x generation (opus-5, sonnet-5,
-// fable-5) all support it but matched none of those substrings, so
-// structuredOutputMode "auto" silently fell back to the tool_choice-forcing
-// tool trick — which the Messages API rejects when thinking is enabled.
+// Source: https://platform.claude.com/docs/en/build-with-claude/structured-outputs#compatibility
+var directNativeOutputFormatModels = []string{
+	"claude-fable-5", "claude-mythos-5", "claude-mythos-preview",
+	"claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+	"claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5",
+	"claude-opus-4-5", "claude-haiku-4-5",
+}
+
+// bedrockNativeOutputFormatModels is the documented Amazon Bedrock subset.
+// Source: https://platform.claude.com/docs/en/build-with-claude/structured-outputs#compatibility
+var bedrockNativeOutputFormatModels = []string{
+	"claude-opus-4-6", "claude-sonnet-4-6", "claude-sonnet-4-5",
+	"claude-opus-4-5", "claude-haiku-4-5",
+}
+
+// supportsNativeOutputFormat reports whether the model supports native
+// structured output. It consults the adapter-provided compatibility list when
+// set (Bedrock, Vertex, Azure, MiniMax), otherwise the direct-Anthropic list.
 func (m *chatModel) supportsNativeOutputFormat() bool {
-	major, minor, ok := anthropicModelVersion(m.id)
-	if !ok {
+	models := m.opts.nativeOutputFormatModels
+	if models == nil {
+		models = directNativeOutputFormatModels
+	}
+	return modelMatchesAny(m.id, models)
+}
+
+// modelMatchesAny reports whether modelID matches any base model name in
+// models, allowing documented release-date, @date, and -v suffixed aliases but
+// rejecting unknown future numeric families.
+func modelMatchesAny(modelID string, models []string) bool {
+	id := strings.ToLower(modelID)
+	for _, base := range models {
+		if modelIDMatches(id, base) {
+			return true
+		}
+	}
+	return false
+}
+
+func modelIDMatches(id, base string) bool {
+	idx := strings.Index(id, base)
+	if idx < 0 {
 		return false
 	}
-	if major >= 5 {
+	// The base must be a whole token: preceded by a separator ('.' for Bedrock
+	// prefixes like "anthropic.claude-opus-5") or the start of the string.
+	if idx > 0 {
+		prev := id[idx-1]
+		if prev != '.' && prev != '-' && prev != '/' && prev != ':' {
+			return false
+		}
+	}
+	suffix := id[idx+len(base):]
+	if suffix == "" {
 		return true
 	}
-	// Within the 4.x generation, 4.0 (which appears either bare or with a
-	// release-date suffix, so minor is 0) predates structured output.
-	return major == 4 && minor >= 1
+	// Vertex @date suffix or Bedrock -v versioned suffix.
+	if strings.HasPrefix(suffix, "@") || strings.HasPrefix(suffix, "-v") {
+		return true
+	}
+	// Release-date alias: claude-opus-4-5-20251101.
+	if len(suffix) == 9 && suffix[0] == '-' {
+		for i := 1; i < len(suffix); i++ {
+			if suffix[i] < '0' || suffix[i] > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // injectNativeOutputFormat stores the structured-output schema in
 // ProviderOptions["output_format"]; buildRequest nests it under
-// output_config.format on the wire.
-func injectNativeOutputFormat(params provider.GenerateParams) provider.GenerateParams {
+// output_config.format on the wire. It returns an error when the response
+// format schema is invalid or cannot be expressed for native structured
+// output, so the caller surfaces it rather than silently dropping the
+// requested output mode.
+func injectNativeOutputFormat(params provider.GenerateParams) (provider.GenerateParams, error) {
 	p := params
 	// Copy the map to avoid mutating the caller's ProviderOptions.
 	newOpts := maps.Clone(p.ProviderOptions)
@@ -853,14 +962,18 @@ func injectNativeOutputFormat(params provider.GenerateParams) provider.GenerateP
 	}
 	p.ProviderOptions = newOpts
 	if p.ResponseFormat == nil {
-		return params
+		return params, nil
 	}
 	var schema any
 	if len(p.ResponseFormat.Schema) > 0 {
 		if err := json.Unmarshal(p.ResponseFormat.Schema, &schema); err != nil {
-			return params // schema invalid, fall back to tool trick
+			return params, fmt.Errorf("anthropic: invalid response format schema: %w", err)
 		}
-		schema = stripNativeOutputKeywords(schema)
+		var err error
+		schema, err = transformNativeOutputSchema(schema)
+		if err != nil {
+			return params, fmt.Errorf("anthropic: invalid response format schema: %w", err)
+		}
 	}
 	p.ProviderOptions["output_format"] = map[string]any{
 		"type":   "json_schema",
@@ -868,106 +981,202 @@ func injectNativeOutputFormat(params provider.GenerateParams) provider.GenerateP
 	}
 	// Clear ResponseFormat so the tool trick is not also applied.
 	p.ResponseFormat = nil
-	return p
+	return p, nil
 }
 
-// nativeOutputUnsupportedKeywords lists the JSON Schema validation keywords
-// that Anthropic's native structured-output validator rejects outright, e.g.
-//
-//	output_config.format.schema: For 'number' type, properties maximum,
-//	minimum are not supported
-//
-// Per Anthropic's structured-output schema limitations these are the numeric
-// constraints, the string-length constraints, and the more complex array
-// constraints. Basic types, enum/const, anyOf/allOf, $ref/$defs, string
-// formats, and additionalProperties:false are all supported and are left
-// alone.
-//
-// Only the native output_config.format path needs this. The tool-trick path
-// sends the same schema as a tool's input_schema, where these keywords are
-// advisory (no strict:true) and therefore harmless — so a caller who stays on
-// the tool trick keeps full validation.
-var nativeOutputUnsupportedKeywords = map[string]bool{
-	"minimum":          true,
-	"maximum":          true,
-	"exclusiveMinimum": true,
-	"exclusiveMaximum": true,
-	"multipleOf":       true,
-	"minLength":        true,
-	"maxLength":        true,
-	"minItems":         true,
-	"maxItems":         true,
-	"uniqueItems":      true,
+// supportedNativeFormats lists the string formats Anthropic's native
+// structured-output validator accepts; any other format value is filtered out
+// (and recorded in the description).
+var supportedNativeFormats = map[string]bool{
+	"date-time": true, "time": true, "date": true, "duration": true,
+	"email": true, "hostname": true, "ipv4": true, "ipv6": true,
+	"uuid": true, "uri": true,
 }
 
-// schemaNameKeyedKeywords lists the keywords whose value is a map keyed by
-// *names* — data-model property names or definition names — rather than a
-// schema object. The keys inside them are caller-chosen identifiers, so they
-// must never be filtered as validation keywords: a response field legitimately
-// named "minimum" is not the numeric `minimum` constraint.
-var schemaNameKeyedKeywords = map[string]bool{
-	"properties":        true,
-	"patternProperties": true,
-	"dependentSchemas":  true,
-	"$defs":             true,
-	"definitions":       true,
-}
+// transformNativeOutputSchema mirrors Anthropic's documented SDK schema
+// transformation for native structured output: keep only the keywords the
+// validator supports for the schema's effective type, preserve unsupported
+// constraints in the description, and recurse only into actual subschemas.
+// Literal values (enum members, const, default) are cloned verbatim, never
+// walked as schemas. The input is never mutated.
+//
+// Source: https://platform.claude.com/docs/en/build-with-claude/structured-outputs#how-sdk-transformation-works
+func transformNativeOutputSchema(obj any) (any, error) {
+	m, ok := obj.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("schema must be an object")
+	}
+	remaining := maps.Clone(m)
+	out := make(map[string]any, len(m)+1)
 
-// stripNativeOutputKeywords walks an arbitrary schema value and removes every
-// keyword in nativeOutputUnsupportedKeywords wherever it appears in keyword
-// position, so a schema carrying constraints Anthropic does not support is
-// still usable with native structured output instead of failing the request.
-//
-// Filtering is position-aware. Inside a schemaNameKeyedKeywords map the keys
-// are data-model names, so only their values are sanitised; deleting them
-// would silently drop caller fields from the requested shape and could leave
-// `required` referencing a property that no longer exists. (The sibling
-// sanitiser in internal/gemini instead reconciles `required` against
-// `properties` after the fact; not deleting the properties in the first place
-// makes that unnecessary here.)
-//
-// The function does not mutate its input: new maps/slices are allocated for
-// every container so callers can safely reuse the original schema.
-func stripNativeOutputKeywords(obj any) any {
-	switch v := obj.(type) {
-	case map[string]any:
-		result := make(map[string]any, len(v))
-		for k, val := range v {
-			if nativeOutputUnsupportedKeywords[k] {
-				continue
-			}
-			if schemaNameKeyedKeywords[k] {
-				result[k] = stripNameKeyedMap(val)
-				continue
-			}
-			result[k] = stripNativeOutputKeywords(val)
+	if defs, ok := remaining["$defs"]; ok {
+		transformed, err := transformSchemaMap(defs)
+		if err != nil {
+			return nil, fmt.Errorf("$defs: %w", err)
 		}
-		return result
+		out["$defs"] = transformed
+		delete(remaining, "$defs")
+	}
+	if ref, ok := remaining["$ref"]; ok {
+		out["$ref"] = cloneJSONValue(ref)
+		return out, nil
+	}
+
+	typeName, _ := remaining["type"].(string)
+	delete(remaining, "type")
+	var composition string
+	for _, keyword := range []string{"anyOf", "oneOf", "allOf"} {
+		if _, ok := remaining[keyword].([]any); ok {
+			composition = keyword
+			break
+		}
+	}
+	if composition != "" {
+		transformed, err := transformSchemaList(remaining[composition])
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", composition, err)
+		}
+		if composition == "oneOf" {
+			// Anthropic does not support oneOf; express it as anyOf.
+			out["anyOf"] = transformed
+		} else {
+			out[composition] = transformed
+		}
+		delete(remaining, composition)
+	} else if typeName != "" {
+		out["type"] = typeName
+	} else {
+		return nil, fmt.Errorf("schema must have type, anyOf, oneOf, or allOf")
+	}
+
+	// Literal/annotation keywords are carried verbatim (never recursed).
+	for _, keyword := range []string{"enum", "const", "description", "title"} {
+		if value, ok := remaining[keyword]; ok {
+			out[keyword] = cloneJSONValue(value)
+			delete(remaining, keyword)
+		}
+	}
+
+	switch typeName {
+	case "object":
+		if properties, ok := remaining["properties"]; ok {
+			transformed, err := transformSchemaMap(properties)
+			if err != nil {
+				return nil, fmt.Errorf("properties: %w", err)
+			}
+			out["properties"] = transformed
+		} else {
+			out["properties"] = map[string]any{}
+		}
+		delete(remaining, "properties")
+		// Anthropic requires additionalProperties:false on objects.
+		delete(remaining, "additionalProperties")
+		out["additionalProperties"] = false
+		if required, ok := remaining["required"]; ok {
+			out["required"] = cloneJSONValue(required)
+			delete(remaining, "required")
+		}
+	case "array":
+		if items, ok := remaining["items"]; ok {
+			transformed, err := transformNativeOutputSchema(items)
+			if err != nil {
+				return nil, fmt.Errorf("items: %w", err)
+			}
+			out["items"] = transformed
+			delete(remaining, "items")
+		}
+		// Anthropic accepts minItems only as 0 or 1; anything else is
+		// unsupported and falls through to the description.
+		if minItems, ok := remaining["minItems"].(float64); ok && (minItems == 0 || minItems == 1) {
+			out["minItems"] = minItems
+			delete(remaining, "minItems")
+		}
+	case "string":
+		if format, ok := remaining["format"].(string); ok && supportedNativeFormats[format] {
+			out["format"] = format
+			delete(remaining, "format")
+		}
+	case "integer", "number", "boolean", "null", "":
+	default:
+		return nil, fmt.Errorf("unsupported schema type %q", typeName)
+	}
+
+	// Anything left (pattern, patternProperties, dependentSchemas, unsupported
+	// constraints, etc.) is not expressible as a native constraint; record it
+	// in the description so it is not silently dropped.
+	if len(remaining) > 0 {
+		extra := formatUnsupportedSchemaKeywords(remaining)
+		if description, _ := out["description"].(string); description != "" {
+			out["description"] = description + "\n\n" + extra
+		} else {
+			out["description"] = extra
+		}
+	}
+	return out, nil
+}
+
+func transformSchemaMap(value any) (any, error) {
+	m, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("must be an object")
+	}
+	out := make(map[string]any, len(m))
+	for name, schema := range m {
+		transformed, err := transformNativeOutputSchema(schema)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		out[name] = transformed
+	}
+	return out, nil
+}
+
+func transformSchemaList(value any) (any, error) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("must be an array")
+	}
+	out := make([]any, len(items))
+	for i, schema := range items {
+		transformed, err := transformNativeOutputSchema(schema)
+		if err != nil {
+			return nil, fmt.Errorf("item %d: %w", i, err)
+		}
+		out[i] = transformed
+	}
+	return out, nil
+}
+
+func formatUnsupportedSchemaKeywords(values map[string]any) string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s: %v", key, values[key]))
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
+}
+
+func cloneJSONValue(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for k, item := range v {
+			out[k] = cloneJSONValue(item)
+		}
+		return out
 	case []any:
 		out := make([]any, len(v))
 		for i, item := range v {
-			out[i] = stripNativeOutputKeywords(item)
+			out[i] = cloneJSONValue(item)
 		}
 		return out
 	default:
-		return obj
+		return value
 	}
-}
-
-// stripNameKeyedMap sanitises the values of a name-keyed map (the value of
-// "properties", "$defs", and friends) while preserving every key verbatim.
-// A non-map value is handed back to the ordinary walk, so a malformed schema
-// is passed through rather than mangled here.
-func stripNameKeyedMap(obj any) any {
-	m, ok := obj.(map[string]any)
-	if !ok {
-		return stripNativeOutputKeywords(obj)
-	}
-	result := make(map[string]any, len(m))
-	for name, sub := range m {
-		result[name] = stripNativeOutputKeywords(sub)
-	}
-	return result
 }
 
 const responseFormatToolName = "json_response"
