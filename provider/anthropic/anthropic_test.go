@@ -4398,6 +4398,32 @@ func TestAccumulateStreamedMessage_Parity(t *testing.T) {
 			),
 			complete: `{"id":"msg_5","model":"claude-sonnet-5","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":3,"iterations":[{"type":"assistant","input_tokens":5,"output_tokens":3}]},"context_management":{"applied_edits":[{"type":"clear_tool_uses_20250919"}]}}`,
 		},
+		{
+			name: "citations arrive via citations_delta",
+			stream: sseFrames(
+				`{"type":"message_start","message":{"id":"msg_6","model":"claude-sonnet-5","type":"message","role":"assistant","content":[],"usage":{"input_tokens":5}}}`,
+				`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"See source."}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"citations_delta","citation":{"type":"web","cited_text":"src","url":"https://example.com","title":"Example"}}}`,
+				`{"type":"content_block_stop","index":0}`,
+				`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}`,
+				`{"type":"message_stop"}`,
+			),
+			complete: `{"id":"msg_6","model":"claude-sonnet-5","type":"message","role":"assistant","content":[{"type":"text","text":"See source.","citations":[{"type":"web","cited_text":"src","url":"https://example.com","title":"Example"}]}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":4}}`,
+		},
+		{
+			name: "server tool use and its result block",
+			stream: sseFrames(
+				`{"type":"message_start","message":{"id":"msg_7","model":"claude-sonnet-5","type":"message","role":"assistant","content":[],"usage":{"input_tokens":5}}}`,
+				`{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"toolu_web","name":"web_search","input":{}}}`,
+				`{"type":"content_block_stop","index":0}`,
+				`{"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"toolu_web","content":[{"type":"text","text":"result"}]}}`,
+				`{"type":"content_block_stop","index":1}`,
+				`{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":4}}`,
+				`{"type":"message_stop"}`,
+			),
+			complete: `{"id":"msg_7","model":"claude-sonnet-5","type":"message","role":"assistant","content":[{"type":"server_tool_use","id":"toolu_web","name":"web_search","input":{}},{"type":"web_search_tool_result","tool_use_id":"toolu_web","content":[{"type":"text","text":"result"}]}],"stop_reason":"tool_use","usage":{"input_tokens":5,"output_tokens":4}}`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -4456,28 +4482,43 @@ func TestAccumulateStreamedMessage_NoMessageStart(t *testing.T) {
 }
 
 func TestAccumulateStreamedMessage_TruncatedStream(t *testing.T) {
-	// A stream cut off mid-message still yields the content that arrived;
-	// discarding it would lose a partial answer the caller can use.
+	// A stream cut off before message_stop is a protocol error: reporting the
+	// partial text as a complete generation would hide a truncated response.
 	stream := sseFrames(
 		`{"type":"message_start","message":{"id":"msg_t","model":"claude-sonnet-5","type":"message","content":[],"usage":{"input_tokens":9}}}`,
 		`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
 		`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`,
 	)
 
-	body, err := accumulateStreamedMessage(t.Context(), strings.NewReader(stream))
-	if err != nil {
-		t.Fatalf("accumulateStreamedMessage: %v", err)
+	_, err := accumulateStreamedMessage(t.Context(), strings.NewReader(stream))
+	if err == nil {
+		t.Fatal("expected a protocol error for a stream truncated before message_stop")
 	}
-	result, err := parseResponse(body)
-	if err != nil {
-		t.Fatalf("parseResponse: %v", err)
-	}
-	if result.Text != "partial" {
-		t.Errorf("Text = %q, want %q", result.Text, "partial")
+	if !strings.Contains(err.Error(), "message_stop") {
+		t.Errorf("error = %q, want it to mention message_stop", err.Error())
 	}
 }
 
-func TestAccumulateStreamedMessage_MalformedFrameSkipped(t *testing.T) {
+func TestAccumulateStreamedMessage_UnclosedBlock(t *testing.T) {
+	// A stream that stops after starting a content block but never stops it is
+	// malformed even if message_stop arrives.
+	stream := sseFrames(
+		`{"type":"message_start","message":{"id":"msg_b","model":"claude-sonnet-5","type":"message","content":[],"usage":{"input_tokens":1}}}`,
+		`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`,
+		`{"type":"message_stop"}`,
+	)
+	_, err := accumulateStreamedMessage(t.Context(), strings.NewReader(stream))
+	if err == nil {
+		t.Fatal("expected a protocol error for an unclosed content block")
+	}
+	if !strings.Contains(err.Error(), "unclosed") {
+		t.Errorf("error = %q, want it to mention an unclosed block", err.Error())
+	}
+}
+
+func TestAccumulateStreamedMessage_MalformedFrame(t *testing.T) {
+	// A frame that is not valid JSON is a protocol error, not a frame to skip.
 	stream := sseFrames(
 		`{"type":"message_start","message":{"id":"msg_m","model":"claude-sonnet-5","type":"message","content":[],"usage":{"input_tokens":1}}}`,
 		`not json at all`,
@@ -4488,22 +4529,18 @@ func TestAccumulateStreamedMessage_MalformedFrameSkipped(t *testing.T) {
 		`{"type":"message_stop"}`,
 	)
 
-	body, err := accumulateStreamedMessage(t.Context(), strings.NewReader(stream))
-	if err != nil {
-		t.Fatalf("accumulateStreamedMessage: %v", err)
+	_, err := accumulateStreamedMessage(t.Context(), strings.NewReader(stream))
+	if err == nil {
+		t.Fatal("expected a protocol error for a malformed stream frame")
 	}
-	result, err := parseResponse(body)
-	if err != nil {
-		t.Fatalf("parseResponse: %v", err)
-	}
-	if result.Text != "fine" {
-		t.Errorf("Text = %q, want %q", result.Text, "fine")
+	if !strings.Contains(err.Error(), "malformed") {
+		t.Errorf("error = %q, want it to mention a malformed frame", err.Error())
 	}
 }
 
-func TestAccumulateStreamedMessage_UnparseableToolInputKeepsBlock(t *testing.T) {
-	// Fragments that never form valid JSON must not discard the tool call
-	// itself; the block's original input stands.
+func TestAccumulateStreamedMessage_UnparseableToolInput(t *testing.T) {
+	// Fragments that never form valid JSON are a malformed stream and must not
+	// be reported as a successful tool call with {} input.
 	stream := sseFrames(
 		`{"type":"message_start","message":{"id":"msg_u","model":"claude-sonnet-5","type":"message","content":[],"usage":{"input_tokens":1}}}`,
 		`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_9","name":"read","input":{}}}`,
@@ -4513,19 +4550,28 @@ func TestAccumulateStreamedMessage_UnparseableToolInputKeepsBlock(t *testing.T) 
 		`{"type":"message_stop"}`,
 	)
 
-	body, err := accumulateStreamedMessage(t.Context(), strings.NewReader(stream))
-	if err != nil {
-		t.Fatalf("accumulateStreamedMessage: %v", err)
+	_, err := accumulateStreamedMessage(t.Context(), strings.NewReader(stream))
+	if err == nil {
+		t.Fatal("expected a protocol error for unparseable tool input")
 	}
-	result, err := parseResponse(body)
-	if err != nil {
-		t.Fatalf("parseResponse: %v", err)
+	if !strings.Contains(err.Error(), "tool input") {
+		t.Errorf("error = %q, want it to mention tool input", err.Error())
 	}
-	if len(result.ToolCalls) != 1 {
-		t.Fatalf("ToolCalls = %d, want 1", len(result.ToolCalls))
-	}
-	if result.ToolCalls[0].Name != "read" {
-		t.Errorf("tool name = %q, want read", result.ToolCalls[0].Name)
+}
+
+func TestAccumulateStreamedMessage_BoundedIndex(t *testing.T) {
+	// A hostile or corrupted index must be rejected, not trigger unbounded
+	// allocation.
+	for _, idx := range []string{"1000000000", "-1", "0.5"} {
+		stream := sseFrames(
+			`{"type":"message_start","message":{"id":"msg_i","model":"claude-sonnet-5","type":"message","content":[]}}`,
+			`{"type":"content_block_start","index":`+idx+`,"content_block":{"type":"text","text":""}}`,
+			`{"type":"content_block_stop","index":`+idx+`}`,
+			`{"type":"message_stop"}`,
+		)
+		if _, err := accumulateStreamedMessage(t.Context(), strings.NewReader(stream)); err == nil {
+			t.Errorf("expected a protocol error for content block index %s", idx)
+		}
 	}
 }
 
@@ -4585,6 +4631,7 @@ func TestUseStreamingTransport_ExplicitOverride(t *testing.T) {
 		modelID string
 		opts    map[string]any
 		want    bool
+		wantErr bool
 	}{
 		{
 			name:    "explicit false beats thinks-by-default",
@@ -4599,21 +4646,52 @@ func TestUseStreamingTransport_ExplicitOverride(t *testing.T) {
 			want:    true,
 		},
 		{
-			name:    "non-bool value falls through to willThink",
+			name:    "non-bool value is rejected",
 			modelID: "claude-sonnet-5",
 			opts:    map[string]any{"streamingTransport": "yes"},
-			want:    true,
+			wantErr: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			m := &chatModel{id: tt.modelID}
-			got := m.useStreamingTransport(provider.GenerateParams{ProviderOptions: tt.opts})
+			got, err := m.useStreamingTransport(provider.GenerateParams{ProviderOptions: tt.opts})
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected an error for a non-boolean streamingTransport, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("useStreamingTransport: %v", err)
+			}
 			if got != tt.want {
 				t.Errorf("useStreamingTransport = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestUseStreamingTransport_ProviderAware(t *testing.T) {
+	// Auto-streaming is disabled for adapters that opt out (e.g. Bedrock,
+	// whose streaming endpoint needs a different IAM permission), even for a
+	// model that thinks by default.
+	m := &chatModel{id: "claude-sonnet-5", opts: options{autoStreaming: false}}
+	got, err := m.useStreamingTransport(provider.GenerateParams{})
+	if err != nil {
+		t.Fatalf("useStreamingTransport: %v", err)
+	}
+	if got {
+		t.Error("auto-streaming must be disabled when the adapter opts out")
+	}
+	// An explicit override still wins.
+	got, err = m.useStreamingTransport(provider.GenerateParams{ProviderOptions: map[string]any{"streamingTransport": true}})
+	if err != nil {
+		t.Fatalf("useStreamingTransport: %v", err)
+	}
+	if !got {
+		t.Error("explicit streamingTransport=true must win over the adapter opt-out")
 	}
 }
 

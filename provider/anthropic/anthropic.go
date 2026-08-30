@@ -102,6 +102,12 @@ type options struct {
 	// disables native structured output entirely. Platform adapters set this
 	// to their own documented compatibility set.
 	nativeOutputFormatModels []string
+
+	// autoStreaming enables DoGenerate to transparently issue stream:true and
+	// reassemble the response for long-running (thinking) requests. Enabled by
+	// default for the direct API; adapters whose streaming endpoint needs
+	// extra permissions (Bedrock's InvokeModelWithResponseStream) opt out.
+	autoStreaming bool
 }
 
 // WithAPIKey sets a static API key for authentication.
@@ -211,9 +217,20 @@ func WithNativeOutputFormatSupport(support NativeOutputFormatSupport) Option {
 	}
 }
 
+// WithAutoStreaming controls whether DoGenerate transparently issues stream:true
+// and reassembles the response for long-running (thinking) requests. Enabled by
+// default for the direct API. Adapters whose streaming endpoint needs extra
+// permissions (Bedrock's InvokeModelWithResponseStream) disable it so existing
+// deployments do not regress by default.
+func WithAutoStreaming(enabled bool) Option {
+	return func(o *options) {
+		o.autoStreaming = enabled
+	}
+}
+
 // Chat creates an Anthropic language model for the given model ID.
 func Chat(modelID string, opts ...Option) provider.LanguageModel {
-	o := options{baseURL: defaultBaseURL}
+	o := options{baseURL: defaultBaseURL, autoStreaming: true}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -344,7 +361,10 @@ func (m *chatModel) DoGenerate(ctx context.Context, params provider.GeneratePara
 	// into the same Message document a non-streaming call would have
 	// returned. Transport only — the result is indistinguishable to the
 	// caller. See useStreamingTransport.
-	streaming := m.useStreamingTransport(params)
+	streaming, err := m.useStreamingTransport(params)
+	if err != nil {
+		return nil, err
+	}
 	body := m.buildRequest(params, streaming)
 	toolBetas := collectToolBetas(params.Tools)
 	if hasRemoteRef(params.Messages) {
@@ -977,12 +997,20 @@ func modelIDMatches(id, base string) bool {
 // the guidance warns against.
 //
 // Callers can force the decision either way with
-// ProviderOptions["streamingTransport"] = true / false.
-func (m *chatModel) useStreamingTransport(params provider.GenerateParams) bool {
-	if v, ok := params.ProviderOptions["streamingTransport"].(bool); ok {
-		return v
+// ProviderOptions["streamingTransport"] = true / false. A non-boolean value
+// is rejected rather than silently ignored.
+func (m *chatModel) useStreamingTransport(params provider.GenerateParams) (bool, error) {
+	if v, ok := params.ProviderOptions["streamingTransport"]; ok {
+		b, isBool := v.(bool)
+		if !isBool {
+			return false, fmt.Errorf("anthropic: streamingTransport must be a boolean, got %T", v)
+		}
+		return b, nil
 	}
-	return m.willThink(params)
+	if !m.opts.autoStreaming {
+		return false, nil
+	}
+	return m.willThink(params), nil
 }
 
 // willThink reports whether a request is expected to produce thinking, and
@@ -1725,6 +1753,10 @@ func isServerToolResultBlock(t string) bool {
 // An "error" event is returned as-is: parseResponse already recognises the
 // {"type":"error"} envelope and converts it to an APIError or
 // ContextOverflowError, so error classification stays in one place too.
+// maxStreamedContentBlocks bounds the number of content blocks a reassembled
+// stream may contain, so a hostile index cannot force unbounded allocation.
+const maxStreamedContentBlocks = 500
+
 func accumulateStreamedMessage(ctx context.Context, body io.Reader) ([]byte, error) {
 	scanner := sse.NewScanner(body)
 
@@ -1735,55 +1767,92 @@ func accumulateStreamedMessage(ctx context.Context, body io.Reader) ([]byte, err
 	// only valid JSON once concatenated, so they are buffered until
 	// content_block_stop.
 	toolInput := map[int]*strings.Builder{}
+	// Lifecycle tracking: message_start must precede every other event,
+	// message_stop must terminate a well-formed stream, and every started
+	// content block must be stopped before the stream ends. Violations are
+	// protocol errors, never partial successes.
+	messageStarted := false
+	messageStopped := false
+	openBlocks := map[int]bool{}
 
 	blockAt := func(idx int) map[string]any {
-		if idx < 0 {
-			idx = 0
-		}
 		for len(content) <= idx {
 			content = append(content, map[string]any{})
 		}
 		return content[idx]
 	}
 
-	for data, ok := scanner.Next(); ok; data, ok = scanner.Next() {
+	for {
+		ev, ok := scanner.NextEvent()
+		if !ok {
+			break
+		}
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-
+		// Bedrock emits event:error with AWS exception payloads that carry no
+		// Anthropic "type" field. Surface it as a protocol error rather than
+		// letting it fall through to a partial success.
+		if ev.Type == "error" {
+			return nil, fmt.Errorf("anthropic: stream error event: %s", string(ev.Data))
+		}
 		var event map[string]any
-		if err := json.Unmarshal([]byte(data), &event); err != nil {
-			// Matches parseSSE: a frame we cannot parse is skipped rather
-			// than failing the whole response.
-			continue
+		if err := json.Unmarshal(ev.Data, &event); err != nil {
+			return nil, fmt.Errorf("anthropic: malformed stream event: %w", err)
 		}
 
 		switch eventType, _ := event["type"].(string); eventType {
 		case "message_start":
-			if msg, ok := event["message"].(map[string]any); ok {
-				message = msg
-				// content arrives as separate events; rebuild it from those
-				// rather than trusting the (empty) array in the envelope.
-				if existing, ok := msg["content"].([]any); ok {
-					for _, b := range existing {
-						if bm, ok := b.(map[string]any); ok {
-							content = append(content, bm)
-						}
+			if messageStarted {
+				return nil, fmt.Errorf("anthropic: duplicate message_start")
+			}
+			messageStarted = true
+			msg, ok := event["message"].(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("anthropic: message_start missing message")
+			}
+			message = msg
+			// content arrives as separate events; rebuild it from those rather
+			// than trusting the (usually empty) array in the envelope.
+			if existing, ok := msg["content"].([]any); ok {
+				for _, b := range existing {
+					if bm, ok := b.(map[string]any); ok {
+						content = append(content, bm)
+						openBlocks[len(content)-1] = true
 					}
 				}
 			}
 
 		case "content_block_start":
-			idx := eventIndex(event)
+			if !messageStarted {
+				return nil, fmt.Errorf("anthropic: content_block_start before message_start")
+			}
+			idx, err := streamEventIndex(event)
+			if err != nil {
+				return nil, err
+			}
+			if openBlocks[idx] {
+				return nil, fmt.Errorf("anthropic: duplicate content_block_start at index %d", idx)
+			}
 			block, _ := event["content_block"].(map[string]any)
 			if block == nil {
 				block = map[string]any{}
 			}
 			blockAt(idx)
 			content[idx] = block
+			openBlocks[idx] = true
 
 		case "content_block_delta":
-			idx := eventIndex(event)
+			if !messageStarted {
+				return nil, fmt.Errorf("anthropic: content_block_delta before message_start")
+			}
+			idx, err := streamEventIndex(event)
+			if err != nil {
+				return nil, err
+			}
+			if !openBlocks[idx] {
+				return nil, fmt.Errorf("anthropic: content_block_delta for unopened block %d", idx)
+			}
 			delta, _ := event["delta"].(map[string]any)
 			if delta == nil {
 				continue
@@ -1813,23 +1882,33 @@ func accumulateStreamedMessage(ctx context.Context, body io.Reader) ([]byte, err
 			}
 
 		case "content_block_stop":
-			idx := eventIndex(event)
+			if !messageStarted {
+				return nil, fmt.Errorf("anthropic: content_block_stop before message_start")
+			}
+			idx, err := streamEventIndex(event)
+			if err != nil {
+				return nil, err
+			}
+			if !openBlocks[idx] {
+				return nil, fmt.Errorf("anthropic: content_block_stop for unopened block %d", idx)
+			}
+			delete(openBlocks, idx)
 			sb := toolInput[idx]
+			delete(toolInput, idx)
 			if sb == nil {
 				continue
 			}
-			delete(toolInput, idx)
 			var input any
-			if err := json.Unmarshal([]byte(cmp.Or(sb.String(), "{}")), &input); err == nil {
-				blockAt(idx)["input"] = input
+			if err := json.Unmarshal([]byte(cmp.Or(sb.String(), "{}")), &input); err != nil {
+				// Fragments that never form valid JSON are a malformed stream;
+				// do not report a partial tool call as success.
+				return nil, fmt.Errorf("anthropic: unparseable tool input for block %d: %w", idx, err)
 			}
-			// A fragment set that does not parse leaves the block's original
-			// input in place, mirroring parseSSE's "{}" fallback rather than
-			// failing the response.
+			blockAt(idx)["input"] = input
 
 		case "message_delta":
-			if message == nil {
-				continue
+			if !messageStarted {
+				return nil, fmt.Errorf("anthropic: message_delta before message_start")
 			}
 			// stop_reason, stop_sequence and container all arrive inside
 			// delta, at the same position they occupy in a complete Message.
@@ -1855,23 +1934,32 @@ func accumulateStreamedMessage(ctx context.Context, body io.Reader) ([]byte, err
 				message["context_management"] = cm
 			}
 
+		case "message_stop":
+			if !messageStarted {
+				return nil, fmt.Errorf("anthropic: message_stop before message_start")
+			}
+			messageStopped = true
+
 		case "error":
-			return []byte(data), nil
+			// Anthropic error envelope; hand it to parseResponse unchanged so
+			// error classification stays in one place.
+			return ev.Data, nil
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("reading stream: %w", err)
 	}
-	if message == nil {
-		// No message_start: either an empty body or a stream that failed
-		// before the envelope arrived.
+	if !messageStarted {
 		return nil, &goai.APIError{Message: "anthropic: stream ended before message_start"}
 	}
+	if !messageStopped {
+		return nil, fmt.Errorf("anthropic: stream ended before message_stop")
+	}
+	if len(openBlocks) > 0 {
+		return nil, fmt.Errorf("anthropic: stream ended with %d unclosed content block(s)", len(openBlocks))
+	}
 
-	// A stream truncated after message_start still yields whatever content
-	// arrived; parseResponse maps the absent stop_reason to FinishOther,
-	// which is more useful to a caller than discarding the response.
 	message["content"] = content
 	out, err := json.Marshal(message)
 	if err != nil {
@@ -1880,15 +1968,23 @@ func accumulateStreamedMessage(ctx context.Context, body io.Reader) ([]byte, err
 	return out, nil
 }
 
-// eventIndex reads an SSE event's content block index. A missing or
-// non-numeric index is treated as 0, which is the only block a stream
-// omitting the field could be describing.
-func eventIndex(event map[string]any) int {
-	idx, _ := event["index"].(float64)
-	if idx < 0 {
-		return 0
+// streamEventIndex reads and validates an SSE event's content block index. A
+// missing index is treated as 0. Negative, fractional, overflowing, or
+// over-limit indexes are rejected as protocol errors so a hostile index cannot
+// force unbounded allocation.
+func streamEventIndex(event map[string]any) (int, error) {
+	v, ok := event["index"]
+	if !ok {
+		return 0, nil
 	}
-	return int(idx)
+	f, ok := v.(float64)
+	if !ok {
+		return 0, fmt.Errorf("anthropic: content block index is not a number: %T", v)
+	}
+	if f != float64(int(f)) || f < 0 || f > maxStreamedContentBlocks {
+		return 0, fmt.Errorf("anthropic: invalid content block index %v", f)
+	}
+	return int(f), nil
 }
 
 // appendStringField concatenates a streamed delta onto a content block field,
